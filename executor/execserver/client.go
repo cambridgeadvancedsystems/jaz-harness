@@ -111,6 +111,9 @@ func DialWithConfig(ctx context.Context, cfg DialConfig) (*Client, error) {
 	conn, resp, err := dialer.DialContext(ctx, cfg.URL, headers)
 	if err != nil {
 		if resp != nil {
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
 			return nil, fmt.Errorf("dial jaz-exec-server %s (HTTP %d): %w", cfg.URL, resp.StatusCode, err)
 		}
 		return nil, fmt.Errorf("dial jaz-exec-server %s: %w", cfg.URL, err)
@@ -328,6 +331,11 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 		delete(c.pending, key)
 		c.pendingMu.Unlock()
 		return ctx.Err()
+	case <-c.done:
+		c.pendingMu.Lock()
+		delete(c.pending, key)
+		c.pendingMu.Unlock()
+		return errors.New("jaz-exec-server closed before response")
 	case resp, ok := <-ch:
 		if !ok {
 			return errors.New("jaz-exec-server closed before response")
@@ -357,8 +365,10 @@ func (c *Client) effectiveCwd(raw string) string {
 // Exec runs a command to completion on the server with hard timeout enforcement
 // and guaranteed process-group termination on timeout or cancellation.
 func (c *Client) Exec(ctx context.Context, req executor.ExecRequest) (executor.ExecResult, error) {
+	procID := "exec_" + uuid.NewString()[:8]
 	var res processExecResult
 	err := c.call(ctx, MethodProcessExec, processExecParams{
+		ProcessID: procID,
 		Command:   req.Command,
 		Args:      req.Args,
 		Shell:     req.Shell,
@@ -367,6 +377,9 @@ func (c *Client) Exec(ctx context.Context, req executor.ExecRequest) (executor.E
 		TimeoutMS: req.TimeoutMS,
 	}, &res)
 	if err != nil {
+		if ctx.Err() != nil {
+			c.terminateBestEffort(procID)
+		}
 		return executor.ExecResult{}, err
 	}
 	out := executor.ExecResult{

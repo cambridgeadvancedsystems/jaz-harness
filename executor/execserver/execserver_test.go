@@ -274,12 +274,46 @@ func TestFilesystemOpsAndContainment(t *testing.T) {
 		t.Fatal("expected removing workspace root to fail")
 	}
 
-	// Workspace containment rejects .., outside absolute path, symlink escape, and escaping cwd.
+	// Workspace containment rejects .., outside absolute path, symlink escape, dangling symlinks, and escaping cwd.
 	for _, badPath := range []string{"../secret.txt", outsideFile, "escape-link.txt"} {
 		if _, err := cli.ReadFile(ctx, badPath); !errors.Is(err, execserver.ErrPathEscapes) {
 			t.Fatalf("ReadFile(%q) expected ErrPathEscapes, got: %v", badPath, err)
 		}
 	}
+	danglingFileTarget := filepath.Join(outsideDir, "dangling-write.txt")
+	if err := os.Symlink(danglingFileTarget, filepath.Join(wsDir, "dangling-file.txt")); err != nil {
+		t.Fatalf("create dangling file symlink: %v", err)
+	}
+	if err := cli.WriteFile(ctx, "dangling-file.txt", []byte("blocked")); !errors.Is(err, execserver.ErrPathEscapes) {
+		t.Fatalf("WriteFile through dangling symlink expected ErrPathEscapes, got: %v", err)
+	}
+	if _, err := os.Stat(danglingFileTarget); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dangling symlink target was unexpectedly created: %v", err)
+	}
+
+	danglingDirTarget := filepath.Join(outsideDir, "dangling-dir")
+	if err := os.Symlink(danglingDirTarget, filepath.Join(wsDir, "dangling-dir")); err != nil {
+		t.Fatalf("create dangling dir symlink: %v", err)
+	}
+	if err := cli.WriteFile(ctx, "dangling-dir/sub/pwn.txt", []byte("blocked")); !errors.Is(err, execserver.ErrPathEscapes) {
+		t.Fatalf("WriteFile through dangling dir symlink expected ErrPathEscapes, got: %v", err)
+	}
+	if err := cli.MkdirAll(ctx, "dangling-dir/sub"); !errors.Is(err, execserver.ErrPathEscapes) {
+		t.Fatalf("MkdirAll through dangling dir symlink expected ErrPathEscapes, got: %v", err)
+	}
+	if _, err := os.Stat(danglingDirTarget); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dangling dir symlink target was unexpectedly created: %v", err)
+	}
+
+	// Internal symlink within workspace remains allowed and resolves cleanly.
+	if err := os.Symlink(filepath.Join(wsDir, "moved", "renamed.txt"), filepath.Join(wsDir, "internal-link.txt")); err != nil {
+		t.Fatalf("create internal symlink: %v", err)
+	}
+	linkData, err := cli.ReadFile(ctx, "internal-link.txt")
+	if err != nil || string(linkData) != "line1\nline2\n" {
+		t.Fatalf("ReadFile internal symlink failed: err=%v data=%q", err, string(linkData))
+	}
+
 	if _, err := cli.Exec(ctx, executor.ExecRequest{Command: "pwd", Shell: true, Cwd: outsideDir}); !errors.Is(err, execserver.ErrPathEscapes) {
 		t.Fatalf("Exec with outside cwd expected ErrPathEscapes, got: %v", err)
 	}
@@ -344,6 +378,28 @@ func TestProcessExecTimeoutAndOrphanCleanup(t *testing.T) {
 	waitForPIDDead(t, childPID, 3*time.Second)
 	if got := srv.ActiveProcesses(); got != 0 {
 		t.Fatalf("ActiveProcesses = %d, want 0 after timeout cleanup", got)
+	}
+
+	// Caller context cancellation during one-shot Exec must also kill remote process group.
+	cancelExecPidFile := filepath.Join(wsDir, "exec-cancel.pid")
+	execCtx, execCancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer execCancel()
+	_, cancelExecErr := cli.Exec(execCtx, executor.ExecRequest{
+		Command:   fmt.Sprintf("sleep 30 & echo $! > %q; wait", cancelExecPidFile),
+		Shell:     true,
+		TimeoutMS: 30000,
+	})
+	if !errors.Is(cancelExecErr, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded on canceled Exec, got: %v", cancelExecErr)
+	}
+	cancelExecChildPID := waitForFilePID(t, cancelExecPidFile, 2*time.Second)
+	waitForPIDDead(t, cancelExecChildPID, 3*time.Second)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && srv.ActiveProcesses() > 0 {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if got := srv.ActiveProcesses(); got != 0 {
+		t.Fatalf("ActiveProcesses = %d, want 0 after canceled Exec", got)
 	}
 }
 
@@ -447,6 +503,42 @@ func TestProcessStreamingStdinReadTerminateAndDisconnectCleanup(t *testing.T) {
 		t.Fatalf("ExecTerminate: %v", err)
 	}
 	waitForPIDDead(t, termChildPID, 3*time.Second)
+	// Terminating an already-exited process is safe and idempotent.
+	if err := cli.ExecTerminate(ctx, termProc.ProcessID); err != nil {
+		t.Fatalf("second ExecTerminate on exited process failed: %v", err)
+	}
+
+	// 3b. Blocked stdin write on full pipe must not deadlock concurrent ExecTerminate.
+	pipeBlockProc, err := cli.ExecStart(ctx, executor.ExecRequest{
+		Command:   "sleep 30",
+		Shell:     true,
+		PipeStdin: true,
+		TimeoutMS: 150,
+	})
+	if err != nil || !pipeBlockProc.Running {
+		t.Fatalf("ExecStart pipeBlockProc failed: err=%v res=%+v", err, pipeBlockProc)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		// Write enough chunks to fill kernel pipe buffer on a non-reading child.
+		payload := bytes.Repeat([]byte("Z"), 1024)
+		for i := 0; i < 256; i++ {
+			if err := cli.ExecWriteStdinWithOptions(ctx, pipeBlockProc.ProcessID, payload, false); err != nil {
+				writeDone <- err
+				return
+			}
+		}
+		writeDone <- nil
+	}()
+	time.Sleep(150 * time.Millisecond)
+	if err := cli.ExecTerminate(ctx, pipeBlockProc.ProcessID); err != nil {
+		t.Fatalf("ExecTerminate during blocked stdin write failed: %v", err)
+	}
+	select {
+	case <-writeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stdin writer goroutine did not unblock after ExecTerminate (potential stdinMu deadlock)")
+	}
 
 	// 4. Context cancellation during ExecStart terminates remote process group.
 	cancelPidFile := filepath.Join(wsDir, "cancel.pid")

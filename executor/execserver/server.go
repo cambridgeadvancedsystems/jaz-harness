@@ -50,6 +50,7 @@ type Server struct {
 
 	sessMu   sync.Mutex
 	sessions map[string]*wsSession
+	sessWG   sync.WaitGroup
 	closed   bool
 }
 
@@ -113,8 +114,8 @@ func (s *Server) ActiveProcesses() int {
 	return s.procs.activeCount()
 }
 
-// Close terminates all active process groups and closes active WebSocket
-// sessions.
+// Close terminates all active process groups, closes active WebSocket
+// sessions, and waits for session handlers to finish unwinding.
 func (s *Server) Close() error {
 	s.sessMu.Lock()
 	s.closed = true
@@ -128,6 +129,7 @@ func (s *Server) Close() error {
 		sess.close()
 	}
 	s.procs.terminateAll()
+	s.sessWG.Wait()
 	return nil
 }
 
@@ -174,11 +176,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := &wsSession{
-		id:     "sess_" + uuid.NewString()[:8],
-		server: s,
-		conn:   conn,
-		ctx:    ctx,
-		cancel: cancel,
+		id:       "sess_" + uuid.NewString()[:8],
+		server:   s,
+		conn:     conn,
+		ctx:      ctx,
+		cancel:   cancel,
+		inFlight: make(chan struct{}, DefaultMaxInFlightRequests),
 	}
 
 	s.sessMu.Lock()
@@ -189,14 +192,16 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.sessions[sess.id] = sess
+	s.sessWG.Add(1)
 	s.sessMu.Unlock()
 
 	defer func() {
+		defer s.sessWG.Done()
 		sess.close()
-		sess.wg.Wait()
 		if s.killOnDisconnect {
 			s.procs.terminateSession(sess.id)
 		}
+		sess.wg.Wait()
 		s.sessMu.Lock()
 		delete(s.sessions, sess.id)
 		s.sessMu.Unlock()
@@ -206,11 +211,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 type wsSession struct {
-	id     string
-	server *Server
-	conn   *websocket.Conn
-	ctx    context.Context
-	cancel context.CancelFunc
+	id       string
+	server   *Server
+	conn     *websocket.Conn
+	ctx      context.Context
+	cancel   context.CancelFunc
+	inFlight chan struct{}
 
 	writeMu   sync.Mutex
 	closeOnce sync.Once
@@ -227,6 +233,9 @@ func (sess *wsSession) close() {
 }
 
 func (sess *wsSession) sendFrame(frame rpcFrame) error {
+	if sess.ctx.Err() != nil {
+		return sess.ctx.Err()
+	}
 	frame.JSONRPC = JSONRPCVersion
 	raw, err := json.Marshal(frame)
 	if err != nil {
@@ -305,9 +314,17 @@ func (sess *wsSession) readLoop() {
 			continue
 		}
 
+		select {
+		case sess.inFlight <- struct{}{}:
+		case <-sess.ctx.Done():
+			return
+		}
 		sess.wg.Add(1)
 		go func(req rpcFrame) {
-			defer sess.wg.Done()
+			defer func() {
+				<-sess.inFlight
+				sess.wg.Done()
+			}()
 			sess.dispatch(req)
 		}(frame)
 	}
@@ -360,6 +377,12 @@ func (sess *wsSession) handleMethod(method string, params json.RawMessage) (any,
 		var p fsWriteFileParams
 		if err := decodeParams(params, &p); err != nil {
 			return nil, invalidParamsErr(err)
+		}
+		if base64.StdEncoding.DecodedLen(len(p.DataBase64)) > sess.server.fs.maxWriteBytes+3 {
+			return nil, &rpcErrorBody{
+				Code:    ErrCodeTooLarge,
+				Message: "write payload exceeds maximum write limit",
+			}
 		}
 		data, err := base64.StdEncoding.DecodeString(p.DataBase64)
 		if err != nil {
@@ -461,6 +484,12 @@ func (sess *wsSession) handleMethod(method string, params json.RawMessage) (any,
 		var p processWriteParams
 		if err := decodeParams(params, &p); err != nil {
 			return nil, invalidParamsErr(err)
+		}
+		if base64.StdEncoding.DecodedLen(len(p.Chunk)) > sess.server.procs.maxOutputBytes+3 {
+			return nil, &rpcErrorBody{
+				Code:    ErrCodeTooLarge,
+				Message: "stdin chunk exceeds maximum payload size",
+			}
 		}
 		proc, errBody := sess.server.procs.get(sess.id, p.ProcessID)
 		if errBody != nil {

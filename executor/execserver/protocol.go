@@ -13,14 +13,15 @@ const (
 	ProtocolVersion = "1"
 	JSONRPCVersion  = "2.0"
 
-	DefaultMaxWSMessageBytes = 64 << 20
-	DefaultMaxReadFileBytes  = 32 << 20
-	DefaultMaxWriteFileBytes = 32 << 20
-	DefaultMaxOutputBytes    = executor.DefaultMaxExecOutputBytes
-	DefaultMaxProcesses      = 64
-	DefaultExecTimeout       = 60 * time.Second
-	DefaultStartWait         = 30 * time.Second
-	DefaultKillGracePeriod   = 500 * time.Millisecond
+	DefaultMaxWSMessageBytes   = 64 << 20
+	DefaultMaxReadFileBytes    = 32 << 20
+	DefaultMaxWriteFileBytes   = 32 << 20
+	DefaultMaxOutputBytes      = executor.DefaultMaxExecOutputBytes
+	DefaultMaxProcesses        = 64
+	DefaultMaxInFlightRequests = 64
+	DefaultExecTimeout         = 60 * time.Second
+	DefaultStartWait           = 30 * time.Second
+	DefaultKillGracePeriod     = 500 * time.Millisecond
 )
 
 const (
@@ -172,6 +173,7 @@ type fsRenameParams struct {
 }
 
 type processExecParams struct {
+	ProcessID string            `json:"processId,omitempty"`
 	Command   string            `json:"command"`
 	Args      []string          `json:"args,omitempty"`
 	Shell     bool              `json:"shell,omitempty"`

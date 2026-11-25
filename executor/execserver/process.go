@@ -46,8 +46,6 @@ type managedProcess struct {
 	chunkBytes  int
 	maxRetained int
 	nextSeq     uint64
-	stdoutCap   *executor.CappedBuffer
-	stderrCap   *executor.CappedBuffer
 	exited      bool
 	exitCode    int
 	closed      bool
@@ -77,11 +75,6 @@ func (p *managedProcess) appendChunk(stream string, data []byte) {
 	p.mu.Lock()
 	p.nextSeq++
 	seq := p.nextSeq
-	if stream == "stderr" {
-		_, _ = p.stderrCap.Write(copied)
-	} else {
-		_, _ = p.stdoutCap.Write(copied)
-	}
 	p.chunks = append(p.chunks, storedChunk{
 		seq:    seq,
 		stream: stream,
@@ -243,10 +236,13 @@ func (p *managedProcess) snapshotLocked(afterSeq uint64, maxBytes int) (processR
 	}, len(out) > 0
 }
 
+// terminate kills the process group BEFORE closing stdin so a caller blocked
+// inside stdin.Write on a full pipe unblocks immediately with EPIPE instead
+// of deadlocking on stdinMu.
 func (p *managedProcess) terminate() {
 	p.killOnce.Do(func() {
-		p.closeStdin()
 		terminateProcessGroup(p.cmd, p.pid, p.killGrace, p.waitDoneCh)
+		p.closeStdin()
 	})
 }
 
@@ -360,17 +356,20 @@ func mergeEnv(base []string, overrides map[string]string) []string {
 	return out
 }
 
-func (m *processManager) reserveSlotLocked(procID string) *rpcErrorBody {
+func (m *processManager) registerAndStart(proc *managedProcess) *rpcErrorBody {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if m.closed {
 		return &rpcErrorBody{
 			Code:    ErrCodeInternal,
 			Message: "server is shutting down",
 		}
 	}
-	if _, exists := m.procs[procID]; exists {
+	if _, exists := m.procs[proc.id]; exists {
 		return &rpcErrorBody{
 			Code:    ErrCodeAlreadyExists,
-			Message: fmt.Sprintf("process %q already exists", procID),
+			Message: fmt.Sprintf("process %q already exists", proc.id),
 		}
 	}
 	if len(m.procs) >= m.maxProcesses {
@@ -382,6 +381,17 @@ func (m *processManager) reserveSlotLocked(procID string) *rpcErrorBody {
 			Message: fmt.Sprintf("maximum process limit (%d) reached", m.maxProcesses),
 		}
 	}
+	if err := proc.cmd.Start(); err != nil {
+		return &rpcErrorBody{
+			Code:    ErrCodeInternal,
+			Message: fmt.Sprintf("start process: %v", err),
+		}
+	}
+	if proc.cmd.Process != nil {
+		proc.pid = proc.cmd.Process.Pid
+	}
+	m.procs[proc.id] = proc
+	m.active[proc.id] = struct{}{}
 	return nil
 }
 
@@ -406,6 +416,17 @@ func (m *processManager) evictOldestClosedLocked() {
 	}
 }
 
+func extractExitCode(waitErr error) (int, string) {
+	if waitErr == nil {
+		return 0, ""
+	}
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) {
+		return exitErr.ExitCode(), ""
+	}
+	return -1, waitErr.Error()
+}
+
 func (m *processManager) execSync(ctx context.Context, sessionID string, params processExecParams) (processExecResult, *rpcErrorBody) {
 	cmd, errBody := m.buildCommand(params.Command, params.Args, params.Shell, params.Cwd, params.Env)
 	if errBody != nil {
@@ -424,38 +445,22 @@ func (m *processManager) execSync(ctx context.Context, sessionID string, params 
 	cmd.Stdout = stdoutCap
 	cmd.Stderr = stderrCap
 
-	procID := "exec_" + uuid.NewString()[:8]
-	proc := &managedProcess{
-		id:          procID,
-		sessionID:   sessionID,
-		cmd:         cmd,
-		notifyCh:    make(chan struct{}),
-		maxRetained: m.maxOutputBytes * 2,
-		stdoutCap:   stdoutCap,
-		stderrCap:   stderrCap,
-		createdAt:   time.Now(),
-		waitDoneCh:  make(chan struct{}),
-		killGrace:   m.killGrace,
+	procID := strings.TrimSpace(params.ProcessID)
+	if procID == "" {
+		procID = "exec_" + uuid.NewString()[:8]
 	}
-
-	m.mu.Lock()
-	if errBody := m.reserveSlotLocked(procID); errBody != nil {
-		m.mu.Unlock()
+	proc := &managedProcess{
+		id:         procID,
+		sessionID:  sessionID,
+		cmd:        cmd,
+		notifyCh:   make(chan struct{}),
+		createdAt:  time.Now(),
+		waitDoneCh: make(chan struct{}),
+		killGrace:  m.killGrace,
+	}
+	if errBody := m.registerAndStart(proc); errBody != nil {
 		return processExecResult{}, errBody
 	}
-	if err := cmd.Start(); err != nil {
-		m.mu.Unlock()
-		return processExecResult{}, &rpcErrorBody{
-			Code:    ErrCodeInternal,
-			Message: fmt.Sprintf("start process: %v", err),
-		}
-	}
-	if cmd.Process != nil {
-		proc.pid = cmd.Process.Pid
-	}
-	m.procs[procID] = proc
-	m.active[procID] = struct{}{}
-	m.mu.Unlock()
 
 	var timedOut atomic.Bool
 	watchDone := make(chan struct{})
@@ -480,15 +485,6 @@ func (m *processManager) execSync(ctx context.Context, sessionID string, params 
 	delete(m.procs, procID)
 	m.mu.Unlock()
 
-	exitCode := 0
-	if waitErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = -1
-		}
-	}
 	if timedOut.Load() {
 		return processExecResult{
 			Stdout:   stdoutCap.String(),
@@ -497,6 +493,7 @@ func (m *processManager) execSync(ctx context.Context, sessionID string, params 
 			TimedOut: true,
 		}, nil
 	}
+	exitCode, _ := extractExitCode(waitErr)
 	return processExecResult{
 		Stdout:   stdoutCap.String(),
 		Stderr:   stderrCap.String(),
@@ -536,8 +533,6 @@ func (m *processManager) start(sessionID string, params processStartParams, emit
 		emit:        emit,
 		notifyCh:    make(chan struct{}),
 		maxRetained: m.maxOutputBytes * 2,
-		stdoutCap:   executor.NewCappedBuffer(m.maxOutputBytes),
-		stderrCap:   executor.NewCappedBuffer(m.maxOutputBytes),
 		createdAt:   time.Now(),
 		waitDoneCh:  make(chan struct{}),
 		killGrace:   m.killGrace,
@@ -545,30 +540,12 @@ func (m *processManager) start(sessionID string, params processStartParams, emit
 	cmd.Stdout = procStreamWriter{proc: proc, stream: "stdout"}
 	cmd.Stderr = procStreamWriter{proc: proc, stream: "stderr"}
 
-	m.mu.Lock()
-	if errBody := m.reserveSlotLocked(procID); errBody != nil {
-		m.mu.Unlock()
+	if errBody := m.registerAndStart(proc); errBody != nil {
 		if stdinPipe != nil {
 			_ = stdinPipe.Close()
 		}
 		return "", errBody
 	}
-	if err := cmd.Start(); err != nil {
-		m.mu.Unlock()
-		if stdinPipe != nil {
-			_ = stdinPipe.Close()
-		}
-		return "", &rpcErrorBody{
-			Code:    ErrCodeInternal,
-			Message: fmt.Sprintf("start process: %v", err),
-		}
-	}
-	if cmd.Process != nil {
-		proc.pid = cmd.Process.Pid
-	}
-	m.procs[procID] = proc
-	m.active[procID] = struct{}{}
-	m.mu.Unlock()
 
 	go m.waitManaged(proc)
 	return procID, nil
@@ -578,17 +555,7 @@ func (m *processManager) waitManaged(proc *managedProcess) {
 	waitErr := proc.cmd.Wait()
 	close(proc.waitDoneCh)
 
-	exitCode := 0
-	var failure string
-	if waitErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = -1
-			failure = waitErr.Error()
-		}
-	}
+	exitCode, failure := extractExitCode(waitErr)
 
 	m.mu.Lock()
 	delete(m.active, proc.id)
@@ -630,16 +597,7 @@ func (m *processManager) terminateSession(sessionID string) {
 	}
 	m.mu.Unlock()
 
-	var wg sync.WaitGroup
-	for _, p := range targets {
-		wg.Add(1)
-		go func(proc *managedProcess) {
-			defer wg.Done()
-			proc.terminate()
-			<-proc.waitDoneCh
-		}(p)
-	}
-	wg.Wait()
+	terminateTargets(targets)
 }
 
 func (m *processManager) terminateAll() {
@@ -653,6 +611,10 @@ func (m *processManager) terminateAll() {
 	}
 	m.mu.Unlock()
 
+	terminateTargets(targets)
+}
+
+func terminateTargets(targets []*managedProcess) {
 	var wg sync.WaitGroup
 	for _, p := range targets {
 		wg.Add(1)

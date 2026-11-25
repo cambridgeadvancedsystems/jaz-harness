@@ -66,7 +66,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		_ = srv.Close()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -76,8 +78,11 @@ func main() {
 
 	log.Printf("jaz-exec-server listening on %s (workspace=%s restrict=%v)", addr, srv.WorkspaceDir(), *restrictWorkspace)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		stop()
+		<-shutdownDone
 		log.Fatalf("serve jaz-exec-server: %v", err)
 	}
+	<-shutdownDone
 }
 
 func normalizeListenAddr(raw string) string {

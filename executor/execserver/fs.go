@@ -13,6 +13,8 @@ import (
 	"github.com/cambridgeadvancedsystems/jaz-harness/executor"
 )
 
+const maxSymlinkHops = 40
+
 type fsService struct {
 	workspaceDir        string
 	resolvedWorkspace   string
@@ -72,40 +74,131 @@ func (f *fsService) resolvePath(raw string) (string, *rpcErrorBody) {
 	if !f.restrictToWorkspace {
 		return candidate, nil
 	}
-	if !isWithinRoot(f.workspaceDir, candidate) {
+
+	rel, ok := f.relativeToWorkspace(candidate)
+	if !ok {
 		return "", &rpcErrorBody{
 			Code:    ErrCodePathEscapes,
 			Message: fmt.Sprintf("path %q escapes workspace root", raw),
 		}
 	}
-	if errBody := f.checkSymlinkContainment(candidate, raw); errBody != nil {
+	resolved, errBody := f.resolveWithinWorkspace(rel, raw)
+	if errBody != nil {
 		return "", errBody
 	}
-	return candidate, nil
+	return resolved, nil
 }
 
-func (f *fsService) checkSymlinkContainment(candidate, raw string) *rpcErrorBody {
-	cur := candidate
-	for {
-		eval, err := filepath.EvalSymlinks(cur)
+func (f *fsService) relativeToWorkspace(candidate string) (string, bool) {
+	if isWithinRoot(f.workspaceDir, candidate) {
+		rel, err := filepath.Rel(f.workspaceDir, candidate)
 		if err == nil {
-			if !isWithinRoot(f.resolvedWorkspace, eval) {
-				return &rpcErrorBody{
+			return rel, true
+		}
+	}
+	if f.resolvedWorkspace != f.workspaceDir && isWithinRoot(f.resolvedWorkspace, candidate) {
+		rel, err := filepath.Rel(f.resolvedWorkspace, candidate)
+		if err == nil {
+			return rel, true
+		}
+	}
+	return "", false
+}
+
+// resolveWithinWorkspace walks path components from resolvedWorkspace and
+// resolves both existing and dangling symlinks so neither leaf nor intermediate
+// symlinks can escape the workspace root.
+func (f *fsService) resolveWithinWorkspace(rel, raw string) (string, *rpcErrorBody) {
+	if rel == "." || rel == "" {
+		return f.resolvedWorkspace, nil
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	cur := f.resolvedWorkspace
+	hops := 0
+
+	for i := 0; i < len(parts); i++ {
+		part := parts[i]
+		if part == "" || part == "." {
+			continue
+		}
+		if part == ".." {
+			parent := filepath.Dir(cur)
+			if !isWithinRoot(f.resolvedWorkspace, parent) {
+				return "", &rpcErrorBody{
 					Code:    ErrCodePathEscapes,
 					Message: fmt.Sprintf("path %q resolves outside workspace root", raw),
 				}
 			}
-			return nil
+			cur = parent
+			continue
 		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return mapFSError(err)
+
+		next := filepath.Join(cur, part)
+		info, err := os.Lstat(next)
+		if errors.Is(err, fs.ErrNotExist) {
+			remaining := make([]string, 0, len(parts)-i)
+			remaining = append(remaining, part)
+			remaining = append(remaining, parts[i+1:]...)
+			finalPath := filepath.Clean(filepath.Join(append([]string{cur}, remaining...)...))
+			if !isWithinRoot(f.resolvedWorkspace, finalPath) {
+				return "", &rpcErrorBody{
+					Code:    ErrCodePathEscapes,
+					Message: fmt.Sprintf("path %q resolves outside workspace root", raw),
+				}
+			}
+			return finalPath, nil
 		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return nil
+		if err != nil {
+			return "", mapFSError(err)
 		}
-		cur = parent
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			hops++
+			if hops > maxSymlinkHops {
+				return "", &rpcErrorBody{
+					Code:    ErrCodeInvalidParams,
+					Message: fmt.Sprintf("too many symlink hops resolving %q", raw),
+				}
+			}
+			target, err := os.Readlink(next)
+			if err != nil {
+				return "", mapFSError(err)
+			}
+			var linked string
+			if filepath.IsAbs(target) {
+				linked = filepath.Clean(target)
+			} else {
+				linked = filepath.Clean(filepath.Join(cur, target))
+			}
+			linkedRel, ok := f.relativeToWorkspace(linked)
+			if !ok {
+				return "", &rpcErrorBody{
+					Code:    ErrCodePathEscapes,
+					Message: fmt.Sprintf("path %q resolves outside workspace root", raw),
+				}
+			}
+			rest := parts[i+1:]
+			nextParts := make([]string, 0, len(rest)+4)
+			if linkedRel != "." && linkedRel != "" {
+				nextParts = append(nextParts, strings.Split(filepath.ToSlash(linkedRel), "/")...)
+			}
+			nextParts = append(nextParts, rest...)
+			parts = nextParts
+			cur = f.resolvedWorkspace
+			i = -1
+			continue
+		}
+
+		cur = next
 	}
+
+	if !isWithinRoot(f.resolvedWorkspace, cur) {
+		return "", &rpcErrorBody{
+			Code:    ErrCodePathEscapes,
+			Message: fmt.Sprintf("path %q resolves outside workspace root", raw),
+		}
+	}
+	return cur, nil
 }
 
 func isWithinRoot(root, target string) bool {
@@ -122,17 +215,24 @@ func isWithinRoot(root, target string) bool {
 	return true
 }
 
+func (f *fsService) isWorkspaceRoot(resolved string) bool {
+	return resolved == "/" || resolved == f.workspaceDir || resolved == f.resolvedWorkspace
+}
+
 func (f *fsService) displayPath(absPath string) string {
-	if isWithinRoot(f.workspaceDir, absPath) {
-		rel, err := filepath.Rel(f.workspaceDir, absPath)
-		if err == nil {
-			return filepath.ToSlash(rel)
-		}
+	if rel, ok := f.relativeToWorkspace(absPath); ok {
+		return filepath.ToSlash(rel)
 	}
 	return filepath.ToSlash(absPath)
 }
 
 func (f *fsService) readFile(rawPath string, reqMaxBytes int) ([]byte, *rpcErrorBody) {
+	if strings.TrimSpace(rawPath) == "" {
+		return nil, &rpcErrorBody{
+			Code:    ErrCodeInvalidParams,
+			Message: "path is required",
+		}
+	}
 	resolved, errBody := f.resolvePath(rawPath)
 	if errBody != nil {
 		return nil, errBody
@@ -180,6 +280,12 @@ func (f *fsService) readFile(rawPath string, reqMaxBytes int) ([]byte, *rpcError
 }
 
 func (f *fsService) writeFile(rawPath string, data []byte, mode uint32, createParents bool) *rpcErrorBody {
+	if strings.TrimSpace(rawPath) == "" {
+		return &rpcErrorBody{
+			Code:    ErrCodeInvalidParams,
+			Message: "path is required",
+		}
+	}
 	if len(data) > f.maxWriteBytes {
 		return &rpcErrorBody{
 			Code:    ErrCodeTooLarge,
@@ -190,13 +296,19 @@ func (f *fsService) writeFile(rawPath string, data []byte, mode uint32, createPa
 	if errBody != nil {
 		return errBody
 	}
+	if f.isWorkspaceRoot(resolved) {
+		return &rpcErrorBody{
+			Code:    ErrCodeInvalidParams,
+			Message: fmt.Sprintf("cannot write file over directory root %q", rawPath),
+		}
+	}
 	dir := filepath.Dir(resolved)
 	if createParents {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return mapFSError(err)
 		}
 		if f.restrictToWorkspace {
-			if errBody := f.checkSymlinkContainment(dir, rawPath); errBody != nil {
+			if _, errBody := f.resolvePath(rawPath); errBody != nil {
 				return errBody
 			}
 		}
@@ -216,7 +328,7 @@ func writeFileAtomic(target string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(target)
 	tmp, err := os.CreateTemp(dir, ".jaz-exec-write-*")
 	if err != nil {
-		return os.WriteFile(target, data, perm)
+		return err
 	}
 	tmpName := tmp.Name()
 	cleanup := true
@@ -274,6 +386,12 @@ func (f *fsService) listDir(rawPath string) ([]executor.FileEntry, *rpcErrorBody
 }
 
 func (f *fsService) stat(rawPath string) (executor.FileMetadata, *rpcErrorBody) {
+	if strings.TrimSpace(rawPath) == "" {
+		return executor.FileMetadata{}, &rpcErrorBody{
+			Code:    ErrCodeInvalidParams,
+			Message: "path is required",
+		}
+	}
 	resolved, errBody := f.resolvePath(rawPath)
 	if errBody != nil {
 		return executor.FileMetadata{}, errBody
@@ -301,6 +419,12 @@ func (f *fsService) stat(rawPath string) (executor.FileMetadata, *rpcErrorBody) 
 }
 
 func (f *fsService) mkdirAll(rawPath string, mode uint32) *rpcErrorBody {
+	if strings.TrimSpace(rawPath) == "" {
+		return &rpcErrorBody{
+			Code:    ErrCodeInvalidParams,
+			Message: "path is required",
+		}
+	}
 	resolved, errBody := f.resolvePath(rawPath)
 	if errBody != nil {
 		return errBody
@@ -326,7 +450,7 @@ func (f *fsService) remove(rawPath string, recursive bool) *rpcErrorBody {
 	if errBody != nil {
 		return errBody
 	}
-	if resolved == "/" || resolved == f.workspaceDir {
+	if f.isWorkspaceRoot(resolved) {
 		return &rpcErrorBody{
 			Code:    ErrCodePermission,
 			Message: fmt.Sprintf("refusing to remove root path %q", rawPath),
@@ -362,9 +486,20 @@ func (f *fsService) rename(oldRaw, newRaw string, createParents bool) *rpcErrorB
 	if errBody != nil {
 		return errBody
 	}
+	if f.isWorkspaceRoot(oldResolved) || f.isWorkspaceRoot(newResolved) {
+		return &rpcErrorBody{
+			Code:    ErrCodePermission,
+			Message: "refusing to rename workspace or filesystem root",
+		}
+	}
 	if createParents {
 		if err := os.MkdirAll(filepath.Dir(newResolved), 0o755); err != nil {
 			return mapFSError(err)
+		}
+		if f.restrictToWorkspace {
+			if _, errBody := f.resolvePath(newRaw); errBody != nil {
+				return errBody
+			}
 		}
 	}
 	if err := os.Rename(oldResolved, newResolved); err != nil {

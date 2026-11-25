@@ -19,6 +19,14 @@ func terminateProcessGroup(cmd *exec.Cmd, pid int, grace time.Duration, exited <
 	if pid <= 0 {
 		return
 	}
+	// Never signal a PID after cmd.Wait() has already reaped the process, since
+	// the OS may have recycled the PID for an unrelated process.
+	select {
+	case <-exited:
+		return
+	default:
+	}
+
 	if grace <= 0 {
 		grace = DefaultKillGracePeriod
 	}
@@ -35,7 +43,7 @@ func terminateProcessGroup(cmd *exec.Cmd, pid int, grace time.Duration, exited <
 
 	select {
 	case <-exited:
-		// Still ensure no surviving detached members remain in the process group.
+		// Kill any remaining stubborn grandchildren still sharing PGID pid.
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 		return
 	case <-timer.C:
