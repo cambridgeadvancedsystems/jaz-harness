@@ -12,16 +12,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/auth"
-	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/executor"
-	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/harness"
-	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/provider"
-	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/provider/factory"
-	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/schema"
-	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/server"
-	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/skills"
-	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/store"
-	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/tools"
+	"github.com/cambridgeadvancedsystems/jaz-harness/auth"
+	"github.com/cambridgeadvancedsystems/jaz-harness/executor"
+	"github.com/cambridgeadvancedsystems/jaz-harness/harness"
+	"github.com/cambridgeadvancedsystems/jaz-harness/provider"
+	"github.com/cambridgeadvancedsystems/jaz-harness/provider/factory"
+	"github.com/cambridgeadvancedsystems/jaz-harness/schema"
+	"github.com/cambridgeadvancedsystems/jaz-harness/server"
+	"github.com/cambridgeadvancedsystems/jaz-harness/skills"
+	"github.com/cambridgeadvancedsystems/jaz-harness/store"
+	"github.com/cambridgeadvancedsystems/jaz-harness/tools"
 )
 
 func main() {
