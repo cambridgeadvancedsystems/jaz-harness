@@ -12,6 +12,7 @@ type ExecRequest struct {
 	Cwd       string
 	Env       map[string]string
 	TimeoutMS int64
+	PipeStdin bool
 }
 
 type ExecResult struct {

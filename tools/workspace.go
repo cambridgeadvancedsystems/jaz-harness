@@ -132,7 +132,14 @@ func (w *WorkspaceToolset) RegisterInto(reg *Registry) {
 		}
 		var b strings.Builder
 		b.WriteString(prefix)
-		fmt.Fprintf(&b, "exit_code: %d\n", res.ExitCode)
+		if res.Running {
+			b.WriteString("running: true\n")
+			if res.ProcessID != "" {
+				fmt.Fprintf(&b, "process_id: %s\n", res.ProcessID)
+			}
+		} else {
+			fmt.Fprintf(&b, "exit_code: %d\n", res.ExitCode)
+		}
 		if res.Stdout != "" {
 			b.WriteString("stdout:\n")
 			b.WriteString(TruncateUTF8(res.Stdout, outLimit))
@@ -209,6 +216,9 @@ func (w *WorkspaceToolset) RegisterInto(reg *Registry) {
 		if err := json.Unmarshal(args, &p); err != nil {
 			return "", err
 		}
+		if p.OldText == "" {
+			return "", errors.New("old_text must not be empty")
+		}
 		ex, prefix, err := w.ensure(ctx)
 		if err != nil {
 			return "", err
@@ -238,7 +248,11 @@ func (w *WorkspaceToolset) RegisterInto(reg *Registry) {
 		var p struct {
 			Path string `json:"path"`
 		}
-		_ = json.Unmarshal(args, &p)
+		if len(args) > 0 {
+			if err := json.Unmarshal(args, &p); err != nil {
+				return "", err
+			}
+		}
 		ex, prefix, err := w.ensure(ctx)
 		if err != nil {
 			return "", err

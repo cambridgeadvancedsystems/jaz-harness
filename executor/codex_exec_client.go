@@ -17,6 +17,13 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	maxWSMessageBytes    = 64 << 20
+	maxRetainedProcs     = 256
+	rpcErrCodeNotFound   = -32004
+	processExitGraceWait = 250 * time.Millisecond
+)
+
 type rpcFrame struct {
 	JSONRPC string          `json:"jsonrpc,omitempty"`
 	ID      json.RawMessage `json:"id,omitempty"`
@@ -29,12 +36,123 @@ type rpcFrame struct {
 	} `json:"error,omitempty"`
 }
 
+type rpcError struct {
+	Method  string
+	Code    int
+	Message string
+}
+
+func (e *rpcError) Error() string {
+	return fmt.Sprintf("codex exec-server %s error %d: %s", e.Method, e.Code, e.Message)
+}
+
+type initializeParams struct {
+	ClientName      string `json:"clientName"`
+	ResumeSessionID string `json:"resumeSessionId,omitempty"`
+}
+
+type initializeResult struct {
+	SessionID       string               `json:"sessionId"`
+	EnvironmentInfo *execEnvironmentInfo `json:"environmentInfo,omitempty"`
+}
+
+type execEnvironmentInfo struct {
+	Cwd        string `json:"cwd,omitempty"`
+	PlatformOS string `json:"platformOs,omitempty"`
+}
+
+type execEnvPolicy struct {
+	Inherit               string            `json:"inherit"`
+	IgnoreDefaultExcludes bool              `json:"ignoreDefaultExcludes"`
+	Exclude               []string          `json:"exclude"`
+	Set                   map[string]string `json:"set"`
+	IncludeOnly           []string          `json:"includeOnly"`
+}
+
+type processStartParams struct {
+	ProcessID string            `json:"processId"`
+	Argv      []string          `json:"argv"`
+	Cwd       string            `json:"cwd"`
+	EnvPolicy *execEnvPolicy    `json:"envPolicy,omitempty"`
+	Env       map[string]string `json:"env"`
+	TTY       bool              `json:"tty"`
+	PipeStdin bool              `json:"pipeStdin,omitempty"`
+}
+
+type processStartResult struct {
+	ProcessID string `json:"processId"`
+}
+
+type processReadParams struct {
+	ProcessID string  `json:"processId"`
+	AfterSeq  *uint64 `json:"afterSeq,omitempty"`
+	MaxBytes  *int    `json:"maxBytes,omitempty"`
+	WaitMS    *uint64 `json:"waitMs,omitempty"`
+}
+
+type processWriteParams struct {
+	ProcessID string `json:"processId"`
+	Chunk     string `json:"chunk"`
+	WriteID   string `json:"writeId"`
+}
+
+type processWriteResult struct {
+	Status string `json:"status"`
+}
+
+type processTerminateParams struct {
+	ProcessID string `json:"processId"`
+}
+
+type fsPathParams struct {
+	Path string `json:"path"`
+}
+
+type fsWriteFileParams struct {
+	Path       string `json:"path"`
+	DataBase64 string `json:"dataBase64"`
+}
+
+type fsCreateDirParams struct {
+	Path      string `json:"path"`
+	Recursive bool   `json:"recursive"`
+}
+
+// FileMetadata describes the result of `fs/getMetadata`.
+type FileMetadata struct {
+	IsDirectory  bool   `json:"isDirectory"`
+	IsFile       bool   `json:"isFile"`
+	IsSymlink    bool   `json:"isSymlink"`
+	Size         uint64 `json:"size"`
+	CreatedAtMS  int64  `json:"createdAtMs"`
+	ModifiedAtMS int64  `json:"modifiedAtMs"`
+}
+
+// ExecOutputChunk is one retained output chunk returned by `process/read`.
+type ExecOutputChunk struct {
+	Seq    uint64 `json:"seq"`
+	Stream string `json:"stream"`
+	Data   []byte `json:"data"`
+}
+
+// ExecReadResult holds the decoded response from `process/read`.
+type ExecReadResult struct {
+	Chunks        []ExecOutputChunk
+	NextSeq       uint64
+	Exited        bool
+	ExitCode      *int
+	Closed        bool
+	Failure       string
+	SandboxDenied bool
+}
+
 // CodexExecClient speaks upstream unforked `codex exec-server`'s WebSocket
-// JSON-RPC protocol directly from Go — sending Authorization: Bearer headers
-// over cluster-internal ws:// natively (no loopback TCP forwarder required).
+// JSON-RPC protocol (0.171.0+) directly from Go — sending Authorization: Bearer
+// headers over cluster-internal ws:// natively (no loopback forwarder required).
 type CodexExecClient struct {
 	conn         *websocket.Conn
 	workspaceDir string
+	platformOS   string
 	writeMu      sync.Mutex
 	nextID       atomic.Int64
 	pendingMu    sync.Mutex
@@ -44,21 +162,18 @@ type CodexExecClient struct {
 	done         chan struct{}
 }
 
-const (
-	maxWSMessageBytes = 64 << 20
-	maxRetainedProcs  = 256
-)
-
 type execProcState struct {
 	stdout   *cappedBuffer
 	stderr   *cappedBuffer
 	exitCode int
 	exited   bool
-	doneCh   chan struct{}
+	closed   bool
+	exitedCh chan struct{}
+	closedCh chan struct{}
 }
 
 func DialCodexExecServer(ctx context.Context, wsURL, bearerToken, workspaceDir string) (*CodexExecClient, error) {
-	if workspaceDir == "" {
+	if strings.TrimSpace(workspaceDir) == "" {
 		workspaceDir = "/workspace"
 	}
 	headers := http.Header{}
@@ -80,17 +195,26 @@ func DialCodexExecServer(ctx context.Context, wsURL, bearerToken, workspaceDir s
 	}
 	go c.readLoop()
 
-	if err := c.call(ctx, "initialize", map[string]any{
-		"clientName": "jaz-harness",
-	}, nil); err != nil {
+	var initRes initializeResult
+	if err := c.call(ctx, "initialize", initializeParams{
+		ClientName: "jaz-harness",
+	}, &initRes); err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("codex exec-server initialize: %w", err)
 	}
-	_ = c.notify("initialized", map[string]any{})
+	if initRes.EnvironmentInfo != nil {
+		c.platformOS = strings.ToLower(strings.TrimSpace(initRes.EnvironmentInfo.PlatformOS))
+	}
+	if err := c.notify("initialized", struct{}{}); err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("codex exec-server initialized: %w", err)
+	}
 	return c, nil
 }
 
-func (c *CodexExecClient) WorkspaceDir() string { return c.workspaceDir }
+func (c *CodexExecClient) WorkspaceDir() string {
+	return c.workspaceDir
+}
 
 func (c *CodexExecClient) Close() error {
 	c.writeMu.Lock()
@@ -142,7 +266,7 @@ func (c *CodexExecClient) handleNotification(method string, params json.RawMessa
 		var n struct {
 			ProcessID string `json:"processId"`
 			Stream    string `json:"stream"`
-			Chunk     string `json:"chunk"` // base64 bytes
+			Chunk     string `json:"chunk"`
 		}
 		if json.Unmarshal(params, &n) != nil {
 			return
@@ -173,7 +297,22 @@ func (c *CodexExecClient) handleNotification(method string, params json.RawMessa
 		st.exitCode = n.ExitCode
 		if !st.exited {
 			st.exited = true
-			close(st.doneCh)
+			close(st.exitedCh)
+		}
+		c.procMu.Unlock()
+
+	case "process/closed":
+		var n struct {
+			ProcessID string `json:"processId"`
+		}
+		if json.Unmarshal(params, &n) != nil {
+			return
+		}
+		c.procMu.Lock()
+		st := c.ensureProcLocked(n.ProcessID)
+		if !st.closed {
+			st.closed = true
+			close(st.closedCh)
 		}
 		c.procMu.Unlock()
 	}
@@ -184,15 +323,16 @@ func (c *CodexExecClient) ensureProcLocked(id string) *execProcState {
 	if !ok {
 		if len(c.procs) >= maxRetainedProcs {
 			for k, existing := range c.procs {
-				if existing.exited {
+				if existing.closed || existing.exited {
 					delete(c.procs, k)
 				}
 			}
 		}
 		st = &execProcState{
-			stdout: newCappedBuffer(DefaultMaxExecOutputBytes),
-			stderr: newCappedBuffer(DefaultMaxExecOutputBytes),
-			doneCh: make(chan struct{}),
+			stdout:   newCappedBuffer(DefaultMaxExecOutputBytes),
+			stderr:   newCappedBuffer(DefaultMaxExecOutputBytes),
+			exitedCh: make(chan struct{}),
+			closedCh: make(chan struct{}),
 		}
 		c.procs[id] = st
 	}
@@ -210,11 +350,13 @@ func (c *CodexExecClient) sendFrame(frame rpcFrame) error {
 }
 
 func (c *CodexExecClient) notify(method string, params any) error {
-	raw, _ := json.Marshal(params)
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
 	return c.sendFrame(rpcFrame{
-		JSONRPC: "2.0",
-		Method:  method,
-		Params:  raw,
+		Method: method,
+		Params: raw,
 	})
 }
 
@@ -236,10 +378,9 @@ func (c *CodexExecClient) call(ctx context.Context, method string, params any, o
 		return err
 	}
 	if err := c.sendFrame(rpcFrame{
-		JSONRPC: "2.0",
-		ID:      idRaw,
-		Method:  method,
-		Params:  paramsRaw,
+		ID:     idRaw,
+		Method: method,
+		Params: paramsRaw,
 	}); err != nil {
 		c.pendingMu.Lock()
 		delete(c.pending, key)
@@ -258,7 +399,11 @@ func (c *CodexExecClient) call(ctx context.Context, method string, params any, o
 			return errors.New("codex exec-server closed before response")
 		}
 		if resp.Error != nil {
-			return fmt.Errorf("codex exec-server %s error %d: %s", method, resp.Error.Code, resp.Error.Message)
+			return &rpcError{
+				Method:  method,
+				Code:    resp.Error.Code,
+				Message: resp.Error.Message,
+			}
 		}
 		if out != nil && len(resp.Result) > 0 {
 			return json.Unmarshal(resp.Result, out)
@@ -267,46 +412,38 @@ func (c *CodexExecClient) call(ctx context.Context, method string, params any, o
 	}
 }
 
-func (c *CodexExecClient) ExecStart(ctx context.Context, req ExecRequest) (ExecResult, error) {
-	procID := "proc_" + uuid.NewString()[:8]
-	c.procMu.Lock()
-	st := c.ensureProcLocked(procID)
-	c.procMu.Unlock()
+func (c *CodexExecClient) shellArgv(command string) []string {
+	if c.platformOS == "windows" {
+		return []string{"cmd.exe", "/C", command}
+	}
+	return []string{"/bin/sh", "-lc", command}
+}
 
-	argv := req.Args
-	if req.Shell || len(argv) == 0 {
-		argv = []string{"/bin/sh", "-lc", req.Command}
-	} else {
-		argv = append([]string{req.Command}, req.Args...)
-	}
-	cwd := req.Cwd
-	if cwd == "" {
-		cwd = c.workspaceDir
-	}
-	var startRes struct {
-		ProcessID string `json:"processId"`
-	}
-	if err := c.call(ctx, "process/start", map[string]any{
-		"processId": procID,
-		"argv":      argv,
-		"cwd":       cwd,
-		"env":       req.Env,
-	}, &startRes); err != nil {
-		return ExecResult{}, err
-	}
-	if startRes.ProcessID != "" {
-		procID = startRes.ProcessID
-	}
+func (c *CodexExecClient) waitProcess(ctx context.Context, procID string, st *execProcState, waitDur time.Duration) (ExecResult, error) {
+	timer := time.NewTimer(waitDur)
+	defer timer.Stop()
 
-	waitDur := 30 * time.Second
-	if req.TimeoutMS > 0 {
-		waitDur = time.Duration(req.TimeoutMS) * time.Millisecond
-	}
 	select {
-	case <-st.doneCh:
-	case <-time.After(waitDur):
+	case <-st.closedCh:
+	case <-st.exitedCh:
+		grace := time.NewTimer(processExitGraceWait)
+		select {
+		case <-st.closedCh:
+		case <-grace.C:
+		case <-timer.C:
+		case <-ctx.Done():
+			grace.Stop()
+			return ExecResult{}, ctx.Err()
+		case <-c.done:
+			grace.Stop()
+			return ExecResult{}, errors.New("codex exec-server closed while waiting for process")
+		}
+		grace.Stop()
+	case <-timer.C:
 	case <-ctx.Done():
 		return ExecResult{}, ctx.Err()
+	case <-c.done:
+		return ExecResult{}, errors.New("codex exec-server closed while waiting for process")
 	}
 
 	c.procMu.Lock()
@@ -320,44 +457,141 @@ func (c *CodexExecClient) ExecStart(ctx context.Context, req ExecRequest) (ExecR
 	}, nil
 }
 
-func (c *CodexExecClient) ExecWriteStdin(ctx context.Context, processID, data string) (ExecResult, error) {
-	if err := c.call(ctx, "process/write", map[string]any{
-		"processId": processID,
-		"chunk":     base64.StdEncoding.EncodeToString([]byte(data)),
-	}, nil); err != nil {
+func (c *CodexExecClient) ExecStart(ctx context.Context, req ExecRequest) (ExecResult, error) {
+	procID := "proc_" + uuid.NewString()[:8]
+	c.procMu.Lock()
+	st := c.ensureProcLocked(procID)
+	c.procMu.Unlock()
+
+	argv := req.Args
+	if req.Shell || len(argv) == 0 {
+		argv = c.shellArgv(req.Command)
+	} else {
+		argv = append([]string{req.Command}, req.Args...)
+	}
+	cwd := req.Cwd
+	if strings.TrimSpace(cwd) == "" {
+		cwd = c.workspaceDir
+	}
+	env := req.Env
+	if env == nil {
+		env = map[string]string{}
+	}
+	var startRes processStartResult
+	if err := c.call(ctx, "process/start", processStartParams{
+		ProcessID: procID,
+		Argv:      argv,
+		Cwd:       c.fileURI(cwd),
+		EnvPolicy: &execEnvPolicy{
+			Inherit:               "all",
+			IgnoreDefaultExcludes: false,
+			Exclude:               []string{},
+			Set:                   map[string]string{},
+			IncludeOnly:           []string{},
+		},
+		Env:       env,
+		TTY:       false,
+		PipeStdin: req.PipeStdin,
+	}, &startRes); err != nil {
+		c.procMu.Lock()
+		delete(c.procs, procID)
+		c.procMu.Unlock()
 		return ExecResult{}, err
+	}
+	if startRes.ProcessID != "" && startRes.ProcessID != procID {
+		procID = startRes.ProcessID
+		c.procMu.Lock()
+		st = c.ensureProcLocked(procID)
+		c.procMu.Unlock()
+	}
+
+	waitDur := 30 * time.Second
+	if req.TimeoutMS > 0 {
+		waitDur = time.Duration(req.TimeoutMS) * time.Millisecond
+	}
+	return c.waitProcess(ctx, procID, st, waitDur)
+}
+
+func (c *CodexExecClient) ExecRead(ctx context.Context, processID string, afterSeq uint64, maxBytes int, waitMS uint64) (ExecReadResult, error) {
+	params := processReadParams{
+		ProcessID: processID,
+		AfterSeq:  &afterSeq,
+		WaitMS:    &waitMS,
+	}
+	if maxBytes > 0 {
+		params.MaxBytes = &maxBytes
+	}
+	var raw struct {
+		Chunks []struct {
+			Seq    uint64 `json:"seq"`
+			Stream string `json:"stream"`
+			Chunk  string `json:"chunk"`
+		} `json:"chunks"`
+		NextSeq       uint64 `json:"nextSeq"`
+		Exited        bool   `json:"exited"`
+		ExitCode      *int   `json:"exitCode"`
+		Closed        bool   `json:"closed"`
+		Failure       string `json:"failure"`
+		SandboxDenied bool   `json:"sandboxDenied"`
+	}
+	if err := c.call(ctx, "process/read", params, &raw); err != nil {
+		return ExecReadResult{}, err
+	}
+	chunks := make([]ExecOutputChunk, 0, len(raw.Chunks))
+	for _, ch := range raw.Chunks {
+		decoded, err := base64.StdEncoding.DecodeString(ch.Chunk)
+		if err != nil {
+			decoded = []byte(ch.Chunk)
+		}
+		chunks = append(chunks, ExecOutputChunk{
+			Seq:    ch.Seq,
+			Stream: ch.Stream,
+			Data:   decoded,
+		})
+	}
+	return ExecReadResult{
+		Chunks:        chunks,
+		NextSeq:       raw.NextSeq,
+		Exited:        raw.Exited,
+		ExitCode:      raw.ExitCode,
+		Closed:        raw.Closed,
+		Failure:       raw.Failure,
+		SandboxDenied: raw.SandboxDenied,
+	}, nil
+}
+
+func (c *CodexExecClient) ExecWriteStdin(ctx context.Context, processID, data string) (ExecResult, error) {
+	var res processWriteResult
+	if err := c.call(ctx, "process/write", processWriteParams{
+		ProcessID: processID,
+		Chunk:     base64.StdEncoding.EncodeToString([]byte(data)),
+		WriteID:   "w_" + uuid.NewString()[:8],
+	}, &res); err != nil {
+		return ExecResult{}, err
+	}
+	if res.Status != "" && res.Status != "accepted" {
+		return ExecResult{}, fmt.Errorf("codex exec-server process/write status: %s", res.Status)
 	}
 	c.procMu.Lock()
 	st := c.ensureProcLocked(processID)
 	c.procMu.Unlock()
-	select {
-	case <-st.doneCh:
-	case <-time.After(2 * time.Second):
-	case <-ctx.Done():
-		return ExecResult{}, ctx.Err()
-	}
-	c.procMu.Lock()
-	defer c.procMu.Unlock()
-	return ExecResult{
-		ProcessID: processID,
-		Stdout:    st.stdout.String(),
-		Stderr:    st.stderr.String(),
-		ExitCode:  st.exitCode,
-		Running:   !st.exited,
-	}, nil
+	return c.waitProcess(ctx, processID, st, 2*time.Second)
 }
 
 func (c *CodexExecClient) ExecTerminate(ctx context.Context, processID string) error {
-	return c.call(ctx, "process/terminate", map[string]any{
-		"processId": processID,
+	return c.call(ctx, "process/terminate", processTerminateParams{
+		ProcessID: processID,
 	}, nil)
 }
 
-func (c *CodexExecClient) fullPath(rel string) string {
-	if strings.HasPrefix(rel, "/") {
-		return path.Clean(rel)
+func (c *CodexExecClient) Stat(ctx context.Context, targetPath string) (FileMetadata, error) {
+	var res FileMetadata
+	if err := c.call(ctx, "fs/getMetadata", fsPathParams{
+		Path: c.fileURI(targetPath),
+	}, &res); err != nil {
+		return FileMetadata{}, err
 	}
-	return path.Join(c.workspaceDir, rel)
+	return res, nil
 }
 
 func (c *CodexExecClient) ReadFile(ctx context.Context, filePath string) ([]byte, error) {
@@ -365,8 +599,8 @@ func (c *CodexExecClient) ReadFile(ctx context.Context, filePath string) ([]byte
 		DataBase64 string `json:"dataBase64"`
 		Content    string `json:"content"`
 	}
-	if err := c.call(ctx, "fs/readFile", map[string]any{
-		"path": c.fullPath(filePath),
+	if err := c.call(ctx, "fs/readFile", fsPathParams{
+		Path: c.fileURI(filePath),
 	}, &res); err != nil {
 		return nil, err
 	}
@@ -377,10 +611,30 @@ func (c *CodexExecClient) ReadFile(ctx context.Context, filePath string) ([]byte
 }
 
 func (c *CodexExecClient) WriteFile(ctx context.Context, filePath string, data []byte) error {
-	return c.call(ctx, "fs/writeFile", map[string]any{
-		"path":       c.fullPath(filePath),
-		"dataBase64": base64.StdEncoding.EncodeToString(data),
-	}, nil)
+	uri := c.fileURI(filePath)
+	params := fsWriteFileParams{
+		Path:       uri,
+		DataBase64: base64.StdEncoding.EncodeToString(data),
+	}
+	err := c.call(ctx, "fs/writeFile", params, nil)
+	if err == nil {
+		return nil
+	}
+	var rpcErr *rpcError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != rpcErrCodeNotFound {
+		return err
+	}
+	parentURI := parentFileURI(uri)
+	if parentURI == "" || parentURI == uri {
+		return err
+	}
+	if mkErr := c.call(ctx, "fs/createDirectory", fsCreateDirParams{
+		Path:      parentURI,
+		Recursive: true,
+	}, nil); mkErr != nil {
+		return err
+	}
+	return c.call(ctx, "fs/writeFile", params, nil)
 }
 
 func (c *CodexExecClient) ListDir(ctx context.Context, dirPath string) ([]FileEntry, error) {
@@ -390,18 +644,23 @@ func (c *CodexExecClient) ListDir(ctx context.Context, dirPath string) ([]FileEn
 			IsDirectory bool   `json:"isDirectory"`
 		} `json:"entries"`
 	}
-	if err := c.call(ctx, "fs/readDirectory", map[string]any{
-		"path": c.fullPath(dirPath),
+	if err := c.call(ctx, "fs/readDirectory", fsPathParams{
+		Path: c.fileURI(dirPath),
 	}, &res); err != nil {
 		return nil, err
 	}
+	baseDir := displayDirPath(dirPath)
 	out := make([]FileEntry, 0, len(res.Entries))
 	for _, e := range res.Entries {
 		out = append(out, FileEntry{
 			Name:  e.FileName,
-			Path:  path.Join(dirPath, e.FileName),
+			Path:  path.Join(baseDir, e.FileName),
 			IsDir: e.IsDirectory,
 		})
 	}
 	return out, nil
+}
+
+func (c *CodexExecClient) fileURI(raw string) string {
+	return pathToFileURI(c.workspaceDir, raw)
 }
