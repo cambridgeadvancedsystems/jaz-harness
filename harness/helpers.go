@@ -10,6 +10,7 @@ import (
 
 	"github.com/cambridgeadvancedsystems/jaz-harness/provider"
 	"github.com/cambridgeadvancedsystems/jaz-harness/schema"
+	"github.com/cambridgeadvancedsystems/jaz-harness/tools"
 )
 
 func (e *Engine) Subscribe(threadID string) (<-chan schema.SessionEvent, func()) {
@@ -134,7 +135,9 @@ func (e *Engine) executeToolCalls(ctx context.Context, threadID string, epoch in
 				"arguments": argsAny,
 				"status":    "running",
 			})
-			out, err := e.tools.Execute(ctx, call.Name, call.Arguments)
+			callCtx := tools.WithToolCallID(ctx, call.CallID)
+			res, err := e.tools.ExecuteResult(callCtx, call.Name, call.Arguments)
+			out := res.Text
 			isErr := false
 			if err != nil {
 				isErr = true
@@ -144,18 +147,26 @@ func (e *Engine) executeToolCalls(ctx context.Context, threadID string, epoch in
 			if isErr {
 				status = "failed"
 			}
-			e.publishEvent(ctx, threadID, epoch, schema.EventToolCallResult, map[string]any{
+			evPayload := map[string]any{
 				"call_id":  call.CallID,
 				"tool":     call.Name,
 				"status":   status,
 				"output":   out,
 				"is_error": isErr,
-			})
+			}
+			if len(res.Images) > 0 {
+				evPayload["image_count"] = len(res.Images)
+			}
+			if len(res.Metadata) > 0 {
+				evPayload["metadata"] = res.Metadata
+			}
+			e.publishEvent(ctx, threadID, epoch, schema.EventToolCallResult, evPayload)
 			results[i] = schema.ContentBlock{
 				Type:    schema.BlockToolResult,
 				CallID:  call.CallID,
 				Name:    call.Name,
 				Output:  out,
+				Images:  res.Images,
 				IsError: isErr,
 			}
 		}()
@@ -184,34 +195,97 @@ func (e *Engine) resolveHostedTools(providerName string, req TurnRequest) []sche
 	if len(req.HostedTools) > 0 {
 		return req.HostedTools
 	}
-	enable := e.cfg.DefaultHostedTools
+	enableSearch := e.cfg.DefaultHostedTools
 	if req.EnableWebSearch != nil {
-		enable = *req.EnableWebSearch
+		enableSearch = *req.EnableWebSearch
 	}
-	if !enable {
-		return nil
+	enableImgGen := e.cfg.EnableNativeImageGeneration
+	if req.EnableImageGeneration != nil {
+		enableImgGen = *req.EnableImageGeneration
 	}
-	switch strings.ToLower(strings.TrimSpace(providerName)) {
-	case "openai", "codex_oauth", "azure_openai":
-		return []schema.HostedTool{{Type: "web_search"}}
-	case "anthropic", "vertex_anthropic", "bedrock_anthropic":
-		return []schema.HostedTool{
-			{Type: "web_search_20250305", Name: "web_search"},
-			{Type: "web_fetch_20250910", Name: "web_fetch"},
+
+	norm := strings.ToLower(strings.TrimSpace(providerName))
+	var out []schema.HostedTool
+	if enableSearch {
+		switch norm {
+		case "openai", "codex_oauth", "azure_openai":
+			out = append(out, schema.HostedTool{Type: "web_search"})
+		case "anthropic", "vertex_anthropic", "bedrock_anthropic":
+			out = append(out,
+				schema.HostedTool{Type: "web_search_20250305", Name: "web_search"},
+				schema.HostedTool{Type: "web_fetch_20250910", Name: "web_fetch"},
+			)
+		case "grok", "xai":
+			out = append(out,
+				schema.HostedTool{Type: "x_search", Config: map[string]any{"enable_image_understanding": true}},
+				schema.HostedTool{Type: "web_search"},
+			)
+		case "gemini", "vertex", "vertex_gemini", "vertex_interactions":
+			out = append(out,
+				schema.HostedTool{Type: "google_search"},
+				schema.HostedTool{Type: "url_context"},
+			)
 		}
-	case "grok", "xai":
-		return []schema.HostedTool{
-			{Type: "x_search", Config: map[string]any{"enable_image_understanding": true}},
-			{Type: "web_search"},
-		}
-	case "gemini", "vertex", "vertex_gemini", "vertex_interactions":
-		return []schema.HostedTool{
-			{Type: "google_search"},
-			{Type: "url_context"},
-		}
-	default:
-		return nil
 	}
+	if enableImgGen {
+		switch norm {
+		case "openai", "azure_openai":
+			out = append(out, schema.HostedTool{Type: "image_generation"})
+		}
+	}
+	return out
+}
+
+func (e *Engine) resolveImageGenerator(active provider.Provider) provider.ImageGenerator {
+	if active != nil {
+		if gen, ok := active.(provider.ImageGenerator); ok {
+			return gen
+		}
+	}
+	return e.cfg.ImageGenerator
+}
+
+func usesHostedImageGeneration(providerName, wireFormat string, hosted []schema.HostedTool) bool {
+	if wireFormat != "openai_responses" {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(providerName), "codex_oauth") {
+		return false
+	}
+	for _, h := range hosted {
+		if strings.TrimSpace(h.Type) == "image_generation" {
+			return true
+		}
+	}
+	return false
+}
+
+func omitToolByName(defs []schema.ToolDef, name string) []schema.ToolDef {
+	out := make([]schema.ToolDef, 0, len(defs))
+	for _, d := range defs {
+		if d.Name == name {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+func collectConversationImages(msgs []schema.Message) []schema.ImageSource {
+	var imgs []schema.ImageSource
+	for _, m := range msgs {
+		for _, b := range m.Blocks {
+			if b.Type == schema.BlockImage && b.Image != nil && b.Image.DataURL() != "" {
+				imgs = append(imgs, *b.Image)
+			}
+			for _, img := range b.Images {
+				if img.DataURL() != "" {
+					imgs = append(imgs, img)
+				}
+			}
+		}
+	}
+	return imgs
 }
 
 func (e *Engine) buildProviderCompaction(providerName string, spec schema.ModelSpec) *provider.CompactionConfig {

@@ -206,26 +206,28 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStartTurn(w http.ResponseWriter, r *http.Request) {
 	threadID := r.PathValue("id")
 	var body struct {
-		Prompt          string               `json:"prompt"`
-		Images          []schema.ImageSource `json:"images"`
-		Provider        string               `json:"provider"`
-		Model           string               `json:"model"`
-		ReasoningEffort string               `json:"reasoning_effort"`
-		EnableWebSearch *bool                `json:"enable_web_search"`
-		Async           bool                 `json:"async"`
+		Prompt                string               `json:"prompt"`
+		Images                []schema.ImageSource `json:"images"`
+		Provider              string               `json:"provider"`
+		Model                 string               `json:"model"`
+		ReasoningEffort       string               `json:"reasoning_effort"`
+		EnableWebSearch       *bool                `json:"enable_web_search"`
+		EnableImageGeneration *bool                `json:"enable_image_generation"`
+		Async                 bool                 `json:"async"`
 	}
 	if err := decodeJSONBody(w, r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 	req := harness.TurnRequest{
-		ThreadID:        threadID,
-		Prompt:          body.Prompt,
-		Images:          body.Images,
-		Provider:        body.Provider,
-		Model:           body.Model,
-		ReasoningEffort: body.ReasoningEffort,
-		EnableWebSearch: body.EnableWebSearch,
+		ThreadID:              threadID,
+		Prompt:                body.Prompt,
+		Images:                body.Images,
+		Provider:              body.Provider,
+		Model:                 body.Model,
+		ReasoningEffort:       body.ReasoningEffort,
+		EnableWebSearch:       body.EnableWebSearch,
+		EnableImageGeneration: body.EnableImageGeneration,
 	}
 	if body.Async {
 		if _, err := s.engine.GetThread(r.Context(), threadID); err != nil {

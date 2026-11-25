@@ -172,17 +172,17 @@ func (c *Client) buildRequestBody(req provider.Request) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
-func (c *Client) endpointForModel(model string) (string, error) {
+func (c *Client) endpointForModelAction(model, action string) (string, error) {
 	cleanModel := strings.TrimPrefix(strings.TrimSpace(model), "google/")
 	base := stripLegacyOpenAPISuffix(c.cfg.BaseURL)
 	if c.cfg.RelayMode {
-		return fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", base, url.PathEscape(cleanModel)), nil
+		return fmt.Sprintf("%s/models/%s:%s", base, url.PathEscape(cleanModel), action), nil
 	}
 	if c.cfg.Mode == ModeAIStudio {
-		return fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", base, url.PathEscape(cleanModel)), nil
+		return fmt.Sprintf("%s/v1beta/models/%s:%s", base, url.PathEscape(cleanModel), action), nil
 	}
 	if strings.Contains(base, "/publishers/google") {
-		return fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", base, url.PathEscape(cleanModel)), nil
+		return fmt.Sprintf("%s/models/%s:%s", base, url.PathEscape(cleanModel), action), nil
 	}
 	if c.cfg.Project == "" {
 		return "", errors.New("vertex gemini: Project is required")
@@ -192,22 +192,31 @@ func (c *Client) endpointForModel(model string) (string, error) {
 		loc = "global"
 	}
 	return fmt.Sprintf(
-		"%s/v1beta1/projects/%s/locations/%s/publishers/google/models/%s:streamGenerateContent?alt=sse",
+		"%s/v1beta1/projects/%s/locations/%s/publishers/google/models/%s:%s",
 		base,
 		url.PathEscape(c.cfg.Project),
 		url.PathEscape(loc),
 		url.PathEscape(cleanModel),
+		action,
 	), nil
 }
 
+func (c *Client) endpointForModel(model string) (string, error) {
+	return c.endpointForModelAction(model, "streamGenerateContent?alt=sse")
+}
+
 func (c *Client) doHTTP(ctx context.Context, endpoint string, body []byte) (*http.Response, error) {
+	return c.doHTTPWithAccept(ctx, endpoint, body, "text/event-stream")
+}
+
+func (c *Client) doHTTPWithAccept(ctx context.Context, endpoint string, body []byte, accept string) (*http.Response, error) {
 	return provider.DoWithRetry(ctx, 3, func(_ int) (*http.Response, error) {
 		httpReq, rerr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if rerr != nil {
 			return nil, rerr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("Accept", accept)
 		for k, v := range c.cfg.ExtraHeaders {
 			httpReq.Header.Set(k, v)
 		}
@@ -431,7 +440,11 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 					Text             string `json:"text"`
 					Thought          bool   `json:"thought"`
 					ThoughtSignature string `json:"thoughtSignature"`
-					FunctionCall     *struct {
+					InlineData       *struct {
+						MimeType string `json:"mimeType"`
+						Data     string `json:"data"`
+					} `json:"inlineData"`
+					FunctionCall *struct {
 						ID   string          `json:"id"`
 						Name string          `json:"name"`
 						Args json.RawMessage `json:"args"`
@@ -447,6 +460,26 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 				}
 				if json.Unmarshal(cp, &part) != nil {
 					nativeParts = append(nativeParts, cp)
+					continue
+				}
+
+				if part.InlineData != nil && part.InlineData.Data != "" {
+					flushThought()
+					flushText()
+					nativeParts = append(nativeParts, cp)
+					mt := part.InlineData.MimeType
+					if mt == "" {
+						mt = schema.DetectBase64ImageMediaType(part.InlineData.Data)
+					}
+					canonical = append(canonical, schema.ContentBlock{
+						Type: schema.BlockImage,
+						Image: &schema.ImageSource{
+							MediaType: mt,
+							Base64:    part.InlineData.Data,
+						},
+						ThoughtSignBlob: part.ThoughtSignature,
+						ProviderOpaque:  cp,
+					})
 					continue
 				}
 

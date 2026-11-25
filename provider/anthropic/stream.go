@@ -162,6 +162,7 @@ func (a *anthropicStreamAcc) handleJSONEvent(raw []byte) error {
 		var cb struct {
 			Type      string          `json:"type"`
 			ID        string          `json:"id"`
+			ToolUseID string          `json:"tool_use_id"`
 			Name      string          `json:"name"`
 			Text      string          `json:"text"`
 			Thinking  string          `json:"thinking"`
@@ -169,16 +170,34 @@ func (a *anthropicStreamAcc) handleJSONEvent(raw []byte) error {
 			Data      string          `json:"data"`
 			Content   json.RawMessage `json:"content"`
 			Input     json.RawMessage `json:"input"`
+			Citations []struct {
+				Type      string `json:"type"`
+				URL       string `json:"url"`
+				Title     string `json:"title"`
+				CitedText string `json:"cited_text"`
+			} `json:"citations"`
 		}
 		if json.Unmarshal(ev.ContentBlock, &cb) != nil {
 			return nil
 		}
+		blockID := cb.ID
+		if blockID == "" {
+			blockID = cb.ToolUseID
+		}
 		blk := &blockAcc{
 			blockType:    cb.Type,
-			id:           cb.ID,
+			id:           blockID,
 			name:         cb.Name,
 			initialInput: strings.TrimSpace(string(cb.Input)),
 			redactedData: cb.Data,
+		}
+		for _, c := range cb.Citations {
+			blk.citations = append(blk.citations, schema.Citation{
+				Type:      c.Type,
+				URL:       c.URL,
+				Title:     c.Title,
+				CitedText: c.CitedText,
+			})
 		}
 		if cb.Text != "" {
 			blk.textBuf.WriteString(cb.Text)
@@ -209,11 +228,11 @@ func (a *anthropicStreamAcc) handleJSONEvent(raw []byte) error {
 		if a.emit != nil {
 			switch cb.Type {
 			case "tool_use":
-				a.emit(provider.StreamChunk{Kind: provider.DeltaToolCallStart, CallID: cb.ID, ToolName: cb.Name})
+				a.emit(provider.StreamChunk{Kind: provider.DeltaToolCallStart, CallID: blockID, ToolName: cb.Name})
 			case "server_tool_use":
-				a.emit(provider.StreamChunk{Kind: provider.DeltaHostedToolStart, CallID: cb.ID, ToolName: cb.Name})
+				a.emit(provider.StreamChunk{Kind: provider.DeltaHostedToolStart, CallID: blockID, ToolName: cb.Name})
 			case "web_search_tool_result", "web_fetch_tool_result", "tool_search_tool_result":
-				a.emit(provider.StreamChunk{Kind: provider.DeltaHostedToolComplete, CallID: cb.ID, ToolName: cb.Type})
+				a.emit(provider.StreamChunk{Kind: provider.DeltaHostedToolComplete, CallID: blockID, ToolName: cb.Type})
 			}
 		}
 	case "content_block_delta":

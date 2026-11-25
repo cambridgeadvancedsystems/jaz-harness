@@ -1,7 +1,10 @@
 package schema
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -40,12 +43,67 @@ type ImageSource struct {
 	URL       string `json:"url,omitempty"`
 	MediaType string `json:"media_type,omitempty"`
 	Base64    string `json:"base64,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+	Path      string `json:"path,omitempty"`
+}
+
+// DataURL returns the image URL directly if set, or formats inline base64 data
+// as an RFC 2397 data URL.
+func (s ImageSource) DataURL() string {
+	if s.URL != "" {
+		return s.URL
+	}
+	if s.Base64 == "" {
+		return ""
+	}
+	mt := s.MediaType
+	if mt == "" {
+		mt = DetectBase64ImageMediaType(s.Base64)
+	}
+	return "data:" + mt + ";base64," + s.Base64
+}
+
+// DetectImageMediaType inspects raw image magic bytes and returns a normalized
+// MIME type for PNG, JPEG, GIF, or WebP (or "" when unrecognized).
+func DetectImageMediaType(data []byte) string {
+	if len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
+		return "image/png"
+	}
+	if len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff {
+		return "image/jpeg"
+	}
+	if len(data) >= 6 && (string(data[:6]) == "GIF87a" || string(data[:6]) == "GIF89a") {
+		return "image/gif"
+	}
+	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		return "image/webp"
+	}
+	return ""
+}
+
+// DetectBase64ImageMediaType sniffs the leading bytes of a base64-encoded image
+// and falls back to image/png when unrecognized.
+func DetectBase64ImageMediaType(b64 string) string {
+	trimmed := strings.TrimSpace(b64)
+	if len(trimmed) > 32 {
+		trimmed = trimmed[:32]
+	}
+	if rem := len(trimmed) % 4; rem != 0 {
+		trimmed = trimmed[:len(trimmed)-rem]
+	}
+	if raw, err := base64.StdEncoding.DecodeString(trimmed); err == nil {
+		if mt := DetectImageMediaType(raw); mt != "" {
+			return mt
+		}
+	}
+	return "image/png"
 }
 
 type ContentBlock struct {
 	Type            BlockType       `json:"type"`
 	Text            string          `json:"text,omitempty"`
 	Image           *ImageSource    `json:"image,omitempty"`
+	Images          []ImageSource   `json:"images,omitempty"`
 	Thinking        string          `json:"thinking,omitempty"`
 	Signature       string          `json:"signature,omitempty"`
 	RedactedData    string          `json:"redacted_data,omitempty"`

@@ -93,17 +93,10 @@ func buildGeminiContents(msgs []schema.Message, wireFormat string) []any {
 				}
 				parts = append(parts, part)
 			case schema.BlockImage:
-				if b.Image != nil && b.Image.Base64 != "" {
-					mt := b.Image.MediaType
-					if mt == "" {
-						mt = "image/png"
+				if b.Image != nil {
+					if imgPart := buildGeminiImagePart(*b.Image); imgPart != nil {
+						parts = append(parts, imgPart)
 					}
-					parts = append(parts, map[string]any{
-						"inlineData": map[string]any{
-							"mimeType": mt,
-							"data":     b.Image.Base64,
-						},
-					})
 				}
 			case schema.BlockToolCall:
 				fc := map[string]any{
@@ -134,6 +127,17 @@ func buildGeminiContents(msgs []schema.Message, wireFormat string) []any {
 				if b.CallID != "" {
 					fr["id"] = b.CallID
 				}
+				if len(b.Images) > 0 {
+					var frParts []map[string]any
+					for _, img := range b.Images {
+						if imgPart := buildGeminiImagePart(img); imgPart != nil {
+							frParts = append(frParts, imgPart)
+						}
+					}
+					if len(frParts) > 0 {
+						fr["parts"] = frParts
+					}
+				}
 				parts = append(parts, map[string]any{"functionResponse": fr})
 			case schema.BlockHostedToolCall, schema.BlockHostedToolResult:
 				if len(b.ProviderOpaque) > 0 && m.Native != nil && m.Native.WireFormat == wireFormat {
@@ -156,6 +160,34 @@ func buildGeminiContents(msgs []schema.Message, wireFormat string) []any {
 		}
 	}
 	return out
+}
+
+func buildGeminiImagePart(img schema.ImageSource) map[string]any {
+	if img.Base64 != "" {
+		mt := img.MediaType
+		if mt == "" {
+			mt = schema.DetectBase64ImageMediaType(img.Base64)
+		}
+		return map[string]any{
+			"inlineData": map[string]any{
+				"mimeType": mt,
+				"data":     img.Base64,
+			},
+		}
+	}
+	if img.URL != "" {
+		mt := img.MediaType
+		if mt == "" {
+			mt = "image/png"
+		}
+		return map[string]any{
+			"fileData": map[string]any{
+				"mimeType": mt,
+				"fileUri":  img.URL,
+			},
+		}
+	}
+	return nil
 }
 
 func buildGeminiTools(defs []schema.ToolDef, hosted []schema.HostedTool) ([]map[string]any, bool, bool) {
@@ -184,22 +216,46 @@ func buildGeminiTools(defs []schema.ToolDef, hosted []schema.HostedTool) ([]map[
 		}
 		tools = append(tools, map[string]any{"functionDeclarations": decls})
 	}
+	seenHosted := map[string]bool{}
 	for _, h := range hosted {
-		hasHosted = true
-		switch h.Type {
-		case "google_search", "web_search":
+		switch strings.TrimSpace(h.Type) {
+		case "google_search", "googleSearch", "web_search", "web_search_20250305", "web_search_20260209":
+			if seenHosted["googleSearch"] {
+				continue
+			}
+			seenHosted["googleSearch"] = true
+			hasHosted = true
 			cfg := h.Config
 			if cfg == nil {
 				cfg = map[string]any{}
 			}
 			tools = append(tools, map[string]any{"googleSearch": cfg})
-		case "url_context", "web_fetch":
+		case "url_context", "urlContext", "web_fetch", "web_fetch_20250910", "web_fetch_20260209":
+			if seenHosted["urlContext"] {
+				continue
+			}
+			seenHosted["urlContext"] = true
+			hasHosted = true
 			cfg := h.Config
 			if cfg == nil {
 				cfg = map[string]any{}
 			}
 			tools = append(tools, map[string]any{"urlContext": cfg})
+		case "code_execution", "codeExecution":
+			if seenHosted["codeExecution"] {
+				continue
+			}
+			seenHosted["codeExecution"] = true
+			hasHosted = true
+			cfg := h.Config
+			if cfg == nil {
+				cfg = map[string]any{}
+			}
+			tools = append(tools, map[string]any{"codeExecution": cfg})
+		case "x_search", "image_generation", "web_search_preview", "web_search_preview_2025_03_11":
+			continue
 		default:
+			hasHosted = true
 			cfg := h.Config
 			if cfg == nil {
 				cfg = map[string]any{}

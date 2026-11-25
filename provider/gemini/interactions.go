@@ -134,16 +134,10 @@ func (c *Client) buildInteractionsRequestBody(req provider.Request) ([]byte, err
 					"text": b.Text,
 				})
 			case schema.BlockImage:
-				if b.Image != nil && b.Image.Base64 != "" {
-					mt := b.Image.MediaType
-					if mt == "" {
-						mt = "image/png"
+				if b.Image != nil {
+					if part := buildInteractionsImagePart(*b.Image); part != nil {
+						textContent = append(textContent, part)
 					}
-					textContent = append(textContent, map[string]any{
-						"type":      "image",
-						"data":      b.Image.Base64,
-						"mime_type": mt,
-					})
 				}
 			case schema.BlockToolCall:
 				flushTextStep()
@@ -168,11 +162,29 @@ func (c *Client) buildInteractionsRequestBody(req provider.Request) ([]byte, err
 				if name == "" {
 					name = "tool"
 				}
+				var resultVal any = b.Output
+				if len(b.Images) > 0 {
+					items := make([]map[string]any, 0, len(b.Images)+1)
+					if b.Output != "" {
+						items = append(items, map[string]any{
+							"type": "text",
+							"text": b.Output,
+						})
+					}
+					for _, img := range b.Images {
+						if part := buildInteractionsImagePart(img); part != nil {
+							items = append(items, part)
+						}
+					}
+					if len(items) > 0 {
+						resultVal = items
+					}
+				}
 				steps = append(steps, map[string]any{
 					"type":     "function_result",
 					"call_id":  b.CallID,
 					"name":     name,
-					"result":   b.Output,
+					"result":   resultVal,
 					"is_error": b.IsError,
 				})
 			case schema.BlockHostedToolCall, schema.BlockHostedToolResult:
@@ -186,12 +198,29 @@ func (c *Client) buildInteractionsRequestBody(req provider.Request) ([]byte, err
 	}
 
 	var tools []map[string]any
+	seenHosted := map[string]bool{}
 	for _, h := range req.HostedTools {
-		switch h.Type {
-		case "google_search", "web_search":
+		switch strings.TrimSpace(h.Type) {
+		case "google_search", "googleSearch", "web_search", "web_search_20250305", "web_search_20260209":
+			if seenHosted["google_search"] {
+				continue
+			}
+			seenHosted["google_search"] = true
 			tools = append(tools, map[string]any{"type": "google_search"})
-		case "url_context", "web_fetch":
+		case "url_context", "urlContext", "web_fetch", "web_fetch_20250910", "web_fetch_20260209":
+			if seenHosted["url_context"] {
+				continue
+			}
+			seenHosted["url_context"] = true
 			tools = append(tools, map[string]any{"type": "url_context"})
+		case "code_execution", "codeExecution":
+			if seenHosted["code_execution"] {
+				continue
+			}
+			seenHosted["code_execution"] = true
+			tools = append(tools, map[string]any{"type": "code_execution"})
+		case "x_search", "image_generation", "web_search_preview", "web_search_preview_2025_03_11":
+			continue
 		default:
 			obj := map[string]any{"type": h.Type}
 			for k, v := range h.Config {
@@ -557,6 +586,7 @@ func parseInteractionsSSE(r io.Reader, providerID, fallbackModel string, emit pr
 	if len(rawItems) == 0 && len(completedSteps) > 0 {
 		rawItems = completedSteps
 	}
+	attachInteractionsCitations(steps, canonical)
 	if interactionID == "" {
 		interactionID = "int_" + uuid.NewString()[:12]
 	}
@@ -575,4 +605,88 @@ func parseInteractionsSSE(r io.Reader, providerID, fallbackModel string, emit pr
 			RawItems:   rawItems,
 		},
 	}, nil
+}
+
+func buildInteractionsImagePart(img schema.ImageSource) map[string]any {
+	if img.Base64 != "" {
+		mt := img.MediaType
+		if mt == "" {
+			mt = schema.DetectBase64ImageMediaType(img.Base64)
+		}
+		return map[string]any{
+			"type":      "image",
+			"data":      img.Base64,
+			"mime_type": mt,
+		}
+	}
+	if img.URL != "" {
+		return map[string]any{
+			"type": "image",
+			"uri":  img.URL,
+		}
+	}
+	return nil
+}
+
+func attachInteractionsCitations(steps map[int]*interactionStepAcc, canonical []schema.ContentBlock) {
+	lastTextIdx := -1
+	for i := range canonical {
+		if canonical[i].Type == schema.BlockText {
+			lastTextIdx = i
+		}
+	}
+	if lastTextIdx < 0 {
+		return
+	}
+	seen := map[string]bool{}
+	for _, c := range canonical[lastTextIdx].Citations {
+		if c.URL != "" {
+			seen[c.URL] = true
+		}
+	}
+	indices := make([]int, 0, len(steps))
+	for idx := range steps {
+		indices = append(indices, idx)
+	}
+	sort.Ints(indices)
+	for _, idx := range indices {
+		st := steps[idx]
+		if st.stepType != "google_search_result" && st.stepType != "url_context_result" {
+			continue
+		}
+		if st.stepMap == nil {
+			continue
+		}
+		collectCitationsFromAny(st.stepMap["result"], seen, &canonical[lastTextIdx].Citations)
+	}
+}
+
+func collectCitationsFromAny(v any, seen map[string]bool, dst *[]schema.Citation) {
+	switch cur := v.(type) {
+	case []any:
+		for _, item := range cur {
+			collectCitationsFromAny(item, seen, dst)
+		}
+	case map[string]any:
+		u, _ := cur["url"].(string)
+		if u == "" {
+			u, _ = cur["uri"].(string)
+		}
+		if u != "" && !seen[u] {
+			seen[u] = true
+			title, _ := cur["title"].(string)
+			*dst = append(*dst, schema.Citation{
+				Type:  "url_citation",
+				URL:   u,
+				Title: title,
+			})
+		}
+		for _, nested := range cur {
+			if _, ok := nested.([]any); ok {
+				collectCitationsFromAny(nested, seen, dst)
+			} else if _, ok := nested.(map[string]any); ok {
+				collectCitationsFromAny(nested, seen, dst)
+			}
+		}
+	}
 }

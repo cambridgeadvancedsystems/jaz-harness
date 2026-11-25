@@ -1,17 +1,23 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cambridgeadvancedsystems/jaz-harness/auth"
+	"github.com/cambridgeadvancedsystems/jaz-harness/executor"
 	"github.com/cambridgeadvancedsystems/jaz-harness/harness"
 	"github.com/cambridgeadvancedsystems/jaz-harness/provider"
 	"github.com/cambridgeadvancedsystems/jaz-harness/provider/factory"
@@ -375,5 +381,140 @@ func TestLiveCacheAndContinuity(t *testing.T) {
 
 	t.Run("vertex_gemini4_neon_generate_content", func(t *testing.T) {
 		runVertexGeminiCase(t, gemini.SurfaceGenerateContent, "gemini-4-neon", "PULSAR-5519")
+	})
+}
+
+func makeLiveSolidPNG(t *testing.T, c color.RGBA) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 64, 64))
+	for y := range 64 {
+		for x := range 64 {
+			img.Set(x, y, c)
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestLiveNativeToolsAndViewImage verifies universal `view_image` multimodal
+// tool responses and native hosted web search against live provider endpoints
+// whenever JAZ_HARNESS_LIVE=1 and local credentials are present.
+func TestLiveNativeToolsAndViewImage(t *testing.T) {
+	if os.Getenv("JAZ_HARNESS_LIVE") != "1" {
+		t.Skip("set JAZ_HARNESS_LIVE=1 to run live native tool tests")
+	}
+
+	runViewImageCheck := func(t *testing.T, provName string, cfg factory.ProfileConfig, model, effort string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		p, err := factory.New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wsRoot := t.TempDir()
+		if err := os.WriteFile(filepath.Join(wsRoot, "swatch.png"), makeLiveSolidPNG(t, color.RGBA{R: 255, G: 0, B: 0, A: 255}), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		reg := provider.NewRegistry()
+		reg.Register(provName, p)
+		toolReg := tools.NewRegistry(nil, nil)
+		ws := tools.NewWorkspaceToolset(func(_ context.Context) (executor.Executor, error) {
+			return executor.NewLocal(wsRoot)
+		})
+		ws.RegisterInto(toolReg)
+
+		eng := harness.New(harness.Config{
+			EnableNativeCache:  true,
+			DefaultHostedTools: true,
+		}, store.NewMemoryStore(), reg, toolReg, nil, nil)
+		th, err := eng.CreateThread(ctx, schema.Thread{
+			Provider:        provName,
+			Model:           model,
+			ReasoningEffort: effort,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := eng.RunTurn(ctx, harness.TurnRequest{
+			ThreadID:        th.ID,
+			Prompt:          "Call view_image on path='swatch.png' and reply with ONLY the single dominant color word (for example: red, green, or blue).",
+			MaxOutputTokens: 256,
+		})
+		if err != nil {
+			t.Fatalf("%s view_image turn failed: %v", provName, err)
+		}
+		if res.Steps < 2 || !strings.Contains(strings.ToLower(res.AssistantText), "red") {
+			t.Fatalf("%s view_image did not visually identify red swatch: steps=%d text=%q", provName, res.Steps, res.AssistantText)
+		}
+		t.Logf("%s LIVE view_image PASS: steps=%d text=%q usage=%+v", provName, res.Steps, strings.TrimSpace(res.AssistantText), res.Usage)
+	}
+
+	t.Run("vertex_gemini_view_image", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		project := gcloudProject(ctx)
+		if project == "" {
+			t.Skip("gcloud project not configured")
+		}
+		if _, err := gcloudAccessToken(ctx); err != nil {
+			t.Skipf("gcloud auth token unavailable: %v", err)
+		}
+		runViewImageCheck(t, "vertex", factory.ProfileConfig{
+			Provider:       "vertex",
+			GeminiSurface:  gemini.SurfaceGenerateContent,
+			VertexProject:  project,
+			VertexLocation: "global",
+			GCPTokenSource: gcloudAccessToken,
+		}, "gemini-4-hydrogen", "low")
+	})
+
+	t.Run("vertex_interactions_view_image", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		project := gcloudProject(ctx)
+		if project == "" {
+			t.Skip("gcloud project not configured")
+		}
+		if _, err := gcloudAccessToken(ctx); err != nil {
+			t.Skipf("gcloud auth token unavailable: %v", err)
+		}
+		runViewImageCheck(t, "vertex", factory.ProfileConfig{
+			Provider:       "vertex",
+			GeminiSurface:  gemini.SurfaceInteractions,
+			VertexProject:  project,
+			VertexLocation: "global",
+			GCPTokenSource: gcloudAccessToken,
+		}, "gemini-4-hydrogen", "low")
+	})
+
+	t.Run("openai_view_image", func(t *testing.T) {
+		key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+		if key == "" {
+			t.Skip("OPENAI_API_KEY not set")
+		}
+		runViewImageCheck(t, "openai", factory.ProfileConfig{
+			Provider: "openai",
+			APIKey:   key,
+		}, "gpt-5.4", "low")
+	})
+
+	t.Run("codex_oauth_view_image", func(t *testing.T) {
+		authPath := auth.DefaultCodexAuthPath()
+		if authPath == "" {
+			t.Skip("codex auth path unavailable")
+		}
+		if _, err := os.Stat(authPath); err != nil {
+			t.Skip("~/.codex/auth.json not present")
+		}
+		runViewImageCheck(t, "codex_oauth", factory.ProfileConfig{
+			Provider:   "codex_oauth",
+			CodexOAuth: auth.NewCodexOAuthManager(auth.CodexOAuthConfig{AuthPath: authPath}),
+		}, "gpt-6.1-sol", "low")
 	})
 }

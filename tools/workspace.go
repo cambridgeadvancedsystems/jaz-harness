@@ -94,8 +94,43 @@ func (w *WorkspaceToolset) Close() error {
 	return nil
 }
 
+// ReadWorkspaceFile lazily attaches the workspace sandbox and reads raw bytes
+// from path (used by view_image and generate_image reference inputs).
+func (w *WorkspaceToolset) ReadWorkspaceFile(ctx context.Context, filePath string) ([]byte, error) {
+	ex, _, err := w.ensure(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return ex.ReadFile(ctx, filePath)
+}
+
+// ReadWorkspaceFileWithPrefix lazily attaches the workspace sandbox, reads raw
+// bytes from path, and returns any first-use AGENTS.md notice.
+func (w *WorkspaceToolset) ReadWorkspaceFileWithPrefix(ctx context.Context, filePath string) ([]byte, string, error) {
+	ex, prefix, err := w.ensure(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	raw, err := ex.ReadFile(ctx, filePath)
+	if err != nil {
+		return nil, "", err
+	}
+	return raw, prefix, nil
+}
+
+// WriteWorkspaceFile lazily attaches the workspace sandbox and writes raw bytes
+// to path (used to persist generated image artifacts).
+func (w *WorkspaceToolset) WriteWorkspaceFile(ctx context.Context, filePath string, data []byte) error {
+	ex, _, err := w.ensure(ctx)
+	if err != nil {
+		return err
+	}
+	return ex.WriteFile(ctx, filePath, data)
+}
+
 // RegisterInto declares the static workspace tools (`exec_command`, `read_file`,
-// `write_file`, `edit_file`, `list_dir`) so tool definitions never mutate mid-turn.
+// `write_file`, `edit_file`, `list_dir`, `view_image`) so tool definitions never
+// mutate mid-turn.
 func (w *WorkspaceToolset) RegisterInto(reg *Registry) {
 	reg.Register(schema.ToolDef{
 		Name:        "exec_command",
@@ -263,5 +298,10 @@ func (w *WorkspaceToolset) RegisterInto(reg *Registry) {
 		}
 		raw, _ := json.Marshal(entries)
 		return prefix + TruncateUTF8(string(raw), w.outputLimit()), nil
+	})
+
+	RegisterViewImageTool(reg, ViewImageConfig{
+		ReadFileWithPrefix: w.ReadWorkspaceFileWithPrefix,
+		Category:           "workspace",
 	})
 }

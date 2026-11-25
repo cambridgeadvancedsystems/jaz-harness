@@ -406,8 +406,11 @@ func buildChatMessages(systemPrompt string, msgs []schema.Message) []map[string]
 	}
 	for _, m := range msgs {
 		var (
-			textParts []string
-			toolCalls []map[string]any
+			textParts   []string
+			imageParts  []map[string]any
+			toolCalls   []map[string]any
+			toolResults []map[string]any
+			toolImages  []map[string]any
 		)
 		for _, b := range m.Blocks {
 			switch b.Type {
@@ -419,6 +422,18 @@ func buildChatMessages(systemPrompt string, msgs []schema.Message) []map[string]
 				if b.Text != "" {
 					textParts = append(textParts, b.Text)
 				}
+			case schema.BlockImage:
+				if b.Image != nil {
+					if part := buildChatImagePart(*b.Image); part != nil {
+						if b.Text != "" && m.Role == schema.RoleAssistant {
+							imageParts = append(imageParts, map[string]any{
+								"type": "text",
+								"text": "[Generated image prompt: " + b.Text + "]",
+							})
+						}
+						imageParts = append(imageParts, part)
+					}
+				}
 			case schema.BlockToolCall:
 				toolCalls = append(toolCalls, map[string]any{
 					"id":   b.CallID,
@@ -429,20 +444,45 @@ func buildChatMessages(systemPrompt string, msgs []schema.Message) []map[string]
 					},
 				})
 			case schema.BlockToolResult:
-				out = append(out, map[string]any{
+				toolResults = append(toolResults, map[string]any{
 					"role":         "tool",
 					"tool_call_id": b.CallID,
 					"content":      b.Output,
 				})
+				if len(b.Images) > 0 {
+					label := b.Name
+					if label == "" {
+						label = "tool"
+					}
+					toolImages = append(toolImages, map[string]any{
+						"type": "text",
+						"text": "[Image output from " + label + "]",
+					})
+					for _, img := range b.Images {
+						if part := buildChatImagePart(img); part != nil {
+							toolImages = append(toolImages, part)
+						}
+					}
+				}
 			}
 		}
-		if len(textParts) > 0 || len(toolCalls) > 0 {
+		if len(textParts) > 0 || len(toolCalls) > 0 || (len(imageParts) > 0 && m.Role != schema.RoleAssistant) {
 			role := string(m.Role)
 			if role == string(schema.RoleDeveloper) {
 				role = "system"
 			}
 			msg := map[string]any{"role": role}
-			if len(textParts) > 0 {
+			if len(imageParts) > 0 && role == "user" {
+				content := make([]map[string]any, 0, len(textParts)+len(imageParts))
+				if len(textParts) > 0 {
+					content = append(content, map[string]any{
+						"type": "text",
+						"text": strings.Join(textParts, "\n"),
+					})
+				}
+				content = append(content, imageParts...)
+				msg["content"] = content
+			} else if len(textParts) > 0 {
 				msg["content"] = strings.Join(textParts, "\n")
 			}
 			if len(toolCalls) > 0 {
@@ -450,8 +490,39 @@ func buildChatMessages(systemPrompt string, msgs []schema.Message) []map[string]
 			}
 			out = append(out, msg)
 		}
+		if len(imageParts) > 0 && m.Role == schema.RoleAssistant {
+			out = append(out, map[string]any{
+				"role":    "user",
+				"content": imageParts,
+			})
+		}
+		out = append(out, toolResults...)
+		if len(toolImages) > 0 {
+			out = append(out, map[string]any{
+				"role":    "user",
+				"content": toolImages,
+			})
+		}
 	}
 	return out
+}
+
+func buildChatImagePart(img schema.ImageSource) map[string]any {
+	u := img.DataURL()
+	if u == "" {
+		return nil
+	}
+	imageURL := map[string]any{"url": u}
+	switch strings.ToLower(strings.TrimSpace(img.Detail)) {
+	case "low", "high", "auto":
+		imageURL["detail"] = strings.ToLower(strings.TrimSpace(img.Detail))
+	case "original":
+		imageURL["detail"] = "high"
+	}
+	return map[string]any{
+		"type":      "image_url",
+		"image_url": imageURL,
+	}
 }
 
 func buildChatTools(defs []schema.ToolDef) []map[string]any {

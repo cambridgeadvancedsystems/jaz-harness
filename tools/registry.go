@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cambridgeadvancedsystems/jaz-harness/mcp"
+	"github.com/cambridgeadvancedsystems/jaz-harness/provider"
 	"github.com/cambridgeadvancedsystems/jaz-harness/schema"
 	"github.com/cambridgeadvancedsystems/jaz-harness/skills"
 )
@@ -19,9 +20,54 @@ const DefaultMaxMCPToolOutputBytes = 256 * 1024
 
 type Handler func(ctx context.Context, args json.RawMessage) (string, error)
 
+// Result holds structured textual and multimodal image outputs from a tool call.
+type Result struct {
+	Text     string
+	Images   []schema.ImageSource
+	Metadata map[string]any
+}
+
+// RichHandler returns both text output and optional multimodal image attachments.
+type RichHandler func(ctx context.Context, args json.RawMessage) (Result, error)
+
 type entry struct {
 	def     schema.ToolDef
-	handler Handler
+	handler RichHandler
+}
+
+type ctxKey int
+
+const (
+	ctxKeyConversationImages ctxKey = iota + 1
+	ctxKeyActiveImageGenerator
+	ctxKeyToolCallID
+)
+
+func WithConversationImages(ctx context.Context, imgs []schema.ImageSource) context.Context {
+	return context.WithValue(ctx, ctxKeyConversationImages, imgs)
+}
+
+func ConversationImagesFromContext(ctx context.Context) []schema.ImageSource {
+	imgs, _ := ctx.Value(ctxKeyConversationImages).([]schema.ImageSource)
+	return imgs
+}
+
+func WithActiveImageGenerator(ctx context.Context, gen provider.ImageGenerator) context.Context {
+	return context.WithValue(ctx, ctxKeyActiveImageGenerator, gen)
+}
+
+func ActiveImageGeneratorFromContext(ctx context.Context) provider.ImageGenerator {
+	gen, _ := ctx.Value(ctxKeyActiveImageGenerator).(provider.ImageGenerator)
+	return gen
+}
+
+func WithToolCallID(ctx context.Context, callID string) context.Context {
+	return context.WithValue(ctx, ctxKeyToolCallID, callID)
+}
+
+func ToolCallIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(ctxKeyToolCallID).(string)
+	return id
 }
 
 // Registry manages a small, deterministic, immutable eager core alongside a
@@ -60,10 +106,19 @@ func (r *Registry) SetMaxMCPToolOutputBytes(limit int) {
 	r.mu.Unlock()
 }
 
-// Register adds a tool definition and handler. External MCP or plugin tools
-// (`ServerID != ""` or `PluginID != ""`) are strictly enforced as deferred so
-// the eager core schema stays small and immutable across turns.
+// Register adds a text-only tool definition and handler. External MCP or plugin
+// tools (`ServerID != ""` or `PluginID != ""`) are strictly enforced as deferred
+// so the eager core schema stays small and immutable across turns.
 func (r *Registry) Register(def schema.ToolDef, h Handler) {
+	r.RegisterRich(def, func(ctx context.Context, args json.RawMessage) (Result, error) {
+		out, err := h(ctx, args)
+		return Result{Text: out}, err
+	})
+}
+
+// RegisterRich adds a multimodal tool definition and handler that can return
+// images alongside textual output.
+func (r *Registry) RegisterRich(def schema.ToolDef, h RichHandler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(def.InputSchema) == 0 {
@@ -104,22 +159,35 @@ func (r *Registry) RegisterMCPServer(ctx context.Context, client *mcp.Client) (t
 		}
 		mcpClient := client
 		remoteName := mt.Name
-		r.Register(schema.ToolDef{
+		r.RegisterRich(schema.ToolDef{
 			Name:         scopedName,
 			Description:  mt.Description,
 			InputSchema:  mt.InputSchema,
 			DeferLoading: true,
 			AlwaysLoad:   false,
 			ServerID:     serverID,
-		}, func(callCtx context.Context, args json.RawMessage) (string, error) {
+		}, func(callCtx context.Context, args json.RawMessage) (Result, error) {
 			res, cerr := mcpClient.CallTool(callCtx, remoteName, args)
 			if cerr != nil {
-				return "", cerr
+				return Result{}, cerr
 			}
-			var parts []string
+			var (
+				parts  []string
+				images []schema.ImageSource
+			)
 			for _, item := range res.Content {
 				if item.Text != "" {
 					parts = append(parts, item.Text)
+				}
+				if item.Type == "image" && strings.TrimSpace(item.Data) != "" {
+					mt := item.MimeType
+					if mt == "" {
+						mt = schema.DetectBase64ImageMediaType(item.Data)
+					}
+					images = append(images, schema.ImageSource{
+						MediaType: mt,
+						Base64:    strings.TrimSpace(item.Data),
+					})
 				}
 			}
 			out := strings.Join(parts, "\n")
@@ -131,9 +199,9 @@ func (r *Registry) RegisterMCPServer(ctx context.Context, client *mcp.Client) (t
 			r.mu.RUnlock()
 			out = TruncateUTF8(out, capBytes)
 			if res.IsError {
-				return "", fmt.Errorf("%s", out)
+				return Result{}, fmt.Errorf("%s", out)
 			}
-			return out, nil
+			return Result{Text: out, Images: images}, nil
 		})
 		toolCount++
 	}
@@ -177,6 +245,13 @@ func (r *Registry) ActiveToolDefs(nativeDeferred bool) []schema.ToolDef {
 	return out
 }
 
+func (r *Registry) Has(name string) bool {
+	r.mu.RLock()
+	_, ok := r.entries[name]
+	r.mu.RUnlock()
+	return ok
+}
+
 func (r *Registry) AllToolDefs() []schema.ToolDef {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -189,11 +264,16 @@ func (r *Registry) AllToolDefs() []schema.ToolDef {
 }
 
 func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	res, err := r.ExecuteResult(ctx, name, args)
+	return res.Text, err
+}
+
+func (r *Registry) ExecuteResult(ctx context.Context, name string, args json.RawMessage) (Result, error) {
 	r.mu.RLock()
 	e, ok := r.entries[name]
 	r.mu.RUnlock()
 	if !ok {
-		return "", fmt.Errorf("unknown tool %q", name)
+		return Result{}, fmt.Errorf("unknown tool %q", name)
 	}
 	return e.handler(ctx, args)
 }
@@ -316,24 +396,24 @@ func (r *Registry) registerBuiltins() {
 		return string(raw), nil
 	})
 
-	r.Register(schema.ToolDef{
+	r.RegisterRich(schema.ToolDef{
 		Name:        "call_tool",
 		Description: "Invoke a deferred tool discovered via search_tools with its exact name and arguments object.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object","additionalProperties":true}},"required":["name","arguments"]}`),
 		AlwaysLoad:  true,
 		Category:    "core",
-	}, func(ctx context.Context, args json.RawMessage) (string, error) {
+	}, func(ctx context.Context, args json.RawMessage) (Result, error) {
 		var p struct {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 		}
 		if err := json.Unmarshal(args, &p); err != nil {
-			return "", err
+			return Result{}, err
 		}
 		if p.Name == "" || p.Name == "call_tool" {
-			return "", fmt.Errorf("invalid target tool name %q", p.Name)
+			return Result{}, fmt.Errorf("invalid target tool name %q", p.Name)
 		}
-		return r.Execute(ctx, p.Name, p.Arguments)
+		return r.ExecuteResult(ctx, p.Name, p.Arguments)
 	})
 
 	if r.skills != nil {

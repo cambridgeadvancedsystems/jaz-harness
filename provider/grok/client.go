@@ -56,13 +56,26 @@ func New(cfg Config) *Client {
 func (c *Client) ID() string         { return c.cfg.ProviderID }
 func (c *Client) WireFormat() string { return WireFormat }
 
+func (c *Client) dialect() responses.Dialect {
+	return responses.Dialect{
+		ProviderID:               c.ID(),
+		WireFormat:               WireFormat,
+		StripExternalWebAccess:   true,
+		AllowImageGenerationTool: false,
+		AllowXSearchTool:         true,
+		AllowOriginalDetail:      false,
+		IsHostedCall:             isGrokHostedCall,
+	}
+}
+
 func (c *Client) buildRequestBody(req provider.Request) ([]byte, error) {
 	if strings.TrimSpace(req.Model) == "" {
 		return nil, errors.New("grok: model is required")
 	}
+	d := c.dialect()
 	payload := map[string]any{
 		"model":  req.Model,
-		"input":  responses.BuildInputItems(req.Messages, WireFormat),
+		"input":  responses.BuildInputItemsWithDialect(req.Messages, d),
 		"stream": true,
 		"store":  false,
 	}
@@ -81,7 +94,7 @@ func (c *Client) buildRequestBody(req provider.Request) ([]byte, error) {
 	if eff := normalizeEffort(req.ReasoningEffort); eff != "" {
 		payload["reasoning"] = map[string]any{"effort": eff}
 	}
-	if tools := responses.BuildTools(req.Tools, req.HostedTools, true); len(tools) > 0 {
+	if tools := responses.BuildToolsForDialect(req.Tools, req.HostedTools, d); len(tools) > 0 {
 		payload["tools"] = tools
 	}
 	if tc := responses.BuildToolChoice(req.ToolChoice); tc != nil {
@@ -134,22 +147,17 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, emit provider
 		}
 	}
 
-	return responses.ParseSSE(resp.Body, responses.Dialect{
-		ProviderID:             c.ID(),
-		WireFormat:             WireFormat,
-		StripExternalWebAccess: true,
-		IsHostedCall:           isGrokHostedCall,
-	}, req.Model, emit)
+	return responses.ParseSSE(resp.Body, c.dialect(), req.Model, emit)
 }
 
 func isGrokHostedCall(callID, name string) bool {
-	if strings.HasPrefix(callID, "xs_") || strings.HasPrefix(callID, "ws_") {
+	if strings.HasPrefix(callID, "xs_") || strings.HasPrefix(callID, "ws_") || strings.HasPrefix(callID, "ci_") {
 		return true
 	}
 	switch name {
-	case "x_search", "x_keyword_search", "x_semantic_search", "x_user_search", "x_thread_fetch",
-		"web_search", "web_search_with_snippets", "browse_page",
-		"code_interpreter", "code_execution":
+	case "x_search", "x_search_call", "x_keyword_search", "x_semantic_search", "x_user_search", "x_thread_fetch",
+		"web_search", "web_search_call", "web_search_with_snippets", "browse_page",
+		"code_interpreter", "code_interpreter_call", "code_execution":
 		return true
 	}
 	return false

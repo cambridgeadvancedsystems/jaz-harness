@@ -43,6 +43,7 @@ type CompactionConfig struct {
 type StreamChunk struct {
 	Kind      StreamDeltaKind
 	Text      string
+	Detail    string
 	CallID    string
 	ToolName  string
 	Arguments string
@@ -109,6 +110,43 @@ type Provider interface {
 // server-side compaction (e.g. OpenAI /v1/responses/compact).
 type RemoteCompactor interface {
 	Compact(ctx context.Context, req CompactRequest) (CompactResponse, error)
+}
+
+// ImageGenerationRequest describes a native or fallback image generation or
+// reference-image editing request.
+type ImageGenerationRequest struct {
+	Prompt                string
+	Model                 string
+	ReferenceImages       []schema.ImageSource
+	Size                  string
+	Quality               string
+	Background            string
+	OutputFormat          string
+	InputFidelity         string
+	TransparentBackground bool
+}
+
+// ImageGenerationResponse carries generated images and optional provider metadata.
+type ImageGenerationResponse struct {
+	ID            string
+	Model         string
+	RevisedPrompt string
+	Images        []schema.ImageSource
+	Metadata      map[string]any
+}
+
+// ImageGenerator is optionally implemented by providers that expose a native
+// image generation and reference-image editing API, and can also be supplied
+// as a configurable fallback backend for providers without native imagegen.
+type ImageGenerator interface {
+	GenerateImage(ctx context.Context, req ImageGenerationRequest) (ImageGenerationResponse, error)
+}
+
+// ImageGeneratorFunc adapts a plain function to the ImageGenerator interface.
+type ImageGeneratorFunc func(ctx context.Context, req ImageGenerationRequest) (ImageGenerationResponse, error)
+
+func (fn ImageGeneratorFunc) GenerateImage(ctx context.Context, req ImageGenerationRequest) (ImageGenerationResponse, error) {
+	return fn(ctx, req)
 }
 
 type APIError struct {

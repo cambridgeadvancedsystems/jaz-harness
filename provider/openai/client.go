@@ -73,14 +73,25 @@ func (c *Client) ID() string         { return c.cfg.ProviderID }
 func (c *Client) WireFormat() string { return WireFormat }
 func (c *Client) isCodexOAuth() bool { return c.cfg.CodexOAuth != nil }
 
+func (c *Client) dialect() responses.Dialect {
+	return responses.Dialect{
+		ProviderID:               c.ID(),
+		WireFormat:               WireFormat,
+		AllowImageGenerationTool: !c.isCodexOAuth(),
+		AllowXSearchTool:         false,
+		AllowOriginalDetail:      true,
+	}
+}
+
 func (c *Client) buildRequestBody(req provider.Request, stream bool) ([]byte, error) {
 	if strings.TrimSpace(req.Model) == "" {
 		return nil, errors.New("openai: model is required")
 	}
 
+	d := c.dialect()
 	payload := map[string]any{
 		"model":  req.Model,
-		"input":  responses.BuildInputItems(req.Messages, WireFormat),
+		"input":  responses.BuildInputItemsWithDialect(req.Messages, d),
 		"stream": stream,
 		"store":  false,
 	}
@@ -106,7 +117,7 @@ func (c *Client) buildRequestBody(req provider.Request, stream bool) ([]byte, er
 		payload["reasoning"] = map[string]any{"effort": effort, "summary": "auto"}
 		payload["include"] = []string{"reasoning.encrypted_content"}
 	}
-	if tools := responses.BuildTools(req.Tools, req.HostedTools, false); len(tools) > 0 {
+	if tools := responses.BuildToolsForDialect(req.Tools, req.HostedTools, d); len(tools) > 0 {
 		payload["tools"] = tools
 		payload["parallel_tool_calls"] = true
 	}
@@ -185,6 +196,10 @@ func (c *Client) applyHeaders(ctx context.Context, httpReq *http.Request, accept
 }
 
 func (c *Client) doAuthenticated(ctx context.Context, endpoint string, body []byte, accept, sessionKey string) (*http.Response, error) {
+	return c.doAuthenticatedWithContentType(ctx, endpoint, body, "application/json", accept, sessionKey)
+}
+
+func (c *Client) doAuthenticatedWithContentType(ctx context.Context, endpoint string, body []byte, contentType, accept, sessionKey string) (*http.Response, error) {
 	refreshed := false
 	return provider.DoWithRetry(ctx, 3, func(_ int) (*http.Response, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
@@ -193,6 +208,9 @@ func (c *Client) doAuthenticated(ctx context.Context, endpoint string, body []by
 		}
 		if err := c.applyHeaders(ctx, httpReq, accept, sessionKey, refreshed); err != nil {
 			return nil, err
+		}
+		if contentType != "" {
+			httpReq.Header.Set("Content-Type", contentType)
 		}
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
@@ -207,6 +225,9 @@ func (c *Client) doAuthenticated(ctx context.Context, endpoint string, body []by
 			}
 			if rerr := c.applyHeaders(ctx, retryReq, accept, sessionKey, true); rerr != nil {
 				return nil, rerr
+			}
+			if contentType != "" {
+				retryReq.Header.Set("Content-Type", contentType)
 			}
 			return c.httpClient.Do(retryReq)
 		}
@@ -243,10 +264,7 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, emit provider
 		}
 	}
 
-	return responses.ParseSSE(resp.Body, responses.Dialect{
-		ProviderID: c.ID(),
-		WireFormat: WireFormat,
-	}, req.Model, emit)
+	return responses.ParseSSE(resp.Body, c.dialect(), req.Model, emit)
 }
 
 func (c *Client) Compact(ctx context.Context, req provider.CompactRequest) (provider.CompactResponse, error) {

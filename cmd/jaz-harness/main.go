@@ -102,6 +102,17 @@ func registerEnvProviders() *provider.Registry {
 	return reg
 }
 
+func resolveFallbackImageGenerator(reg *provider.Registry) provider.ImageGenerator {
+	for _, name := range []string{"openai", "codex_oauth", "gemini", "vertex", "grok"} {
+		if p, ok := reg.Get(name); ok {
+			if gen, ok := p.(provider.ImageGenerator); ok {
+				return gen
+			}
+		}
+	}
+	return nil
+}
+
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", ":8090", "HTTP listen address")
@@ -123,19 +134,27 @@ func runServe(args []string) {
 	}
 	pluginReg := skills.NewPluginRegistry()
 	toolReg := tools.NewRegistry(skillCat, pluginReg)
+	provReg := registerEnvProviders()
+	fallbackImgGen := resolveFallbackImageGenerator(provReg)
+
+	imgCfg := tools.ImageGenerationConfig{Fallback: fallbackImgGen}
 	if *workspaceDir != "" {
 		wsDir := *workspaceDir
 		wsTools := tools.NewWorkspaceToolset(func(_ context.Context) (executor.Executor, error) {
 			return executor.NewLocal(wsDir)
 		})
 		wsTools.RegisterInto(toolReg)
+		imgCfg.ReadFile = wsTools.ReadWorkspaceFile
+		imgCfg.WriteFile = wsTools.WriteWorkspaceFile
 	}
+	tools.RegisterImageGenerationTool(toolReg, imgCfg)
 
 	eng := harness.New(harness.Config{
 		EnableNativeCache:  true,
 		DefaultHostedTools: true,
 		AutoCompact:        true,
-	}, st, registerEnvProviders(), toolReg, skillCat, pluginReg)
+		ImageGenerator:     fallbackImgGen,
+	}, st, provReg, toolReg, skillCat, pluginReg)
 
 	srv := server.New(server.Config{AuthToken: *authToken}, eng)
 	httpSrv := &http.Server{
@@ -192,11 +211,14 @@ func runPrompt(args []string) {
 		return
 	}
 
+	provReg := registerEnvProviders()
+	fallbackImgGen := resolveFallbackImageGenerator(provReg)
 	eng := harness.New(harness.Config{
 		EnableNativeCache:  true,
 		DefaultHostedTools: true,
 		AutoCompact:        true,
-	}, store.NewMemoryStore(), registerEnvProviders(), nil, nil, nil)
+		ImageGenerator:     fallbackImgGen,
+	}, store.NewMemoryStore(), provReg, nil, nil, nil)
 
 	th, err := eng.CreateThread(ctx, schema.Thread{
 		Provider:        *provName,

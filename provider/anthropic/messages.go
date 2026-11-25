@@ -70,18 +70,16 @@ func buildAnthropicMessages(msgs []schema.Message, wireFormat string) []anthropi
 				if b.Image == nil {
 					continue
 				}
-				var src map[string]any
-				if b.Image.Base64 != "" {
-					mt := b.Image.MediaType
-					if mt == "" {
-						mt = "image/png"
+				if imgBlk := buildAnthropicImageBlock(*b.Image); imgBlk != nil {
+					var blocks []map[string]any
+					if b.Text != "" && m.Role == schema.RoleAssistant {
+						blocks = append(blocks, map[string]any{
+							"type": "text",
+							"text": "[Generated image prompt: " + b.Text + "]",
+						})
 					}
-					src = map[string]any{"type": "base64", "media_type": mt, "data": b.Image.Base64}
-				} else if b.Image.URL != "" {
-					src = map[string]any{"type": "url", "url": b.Image.URL}
-				}
-				if src != nil {
-					appendBlocks("user", []map[string]any{{"type": "image", "source": src}})
+					blocks = append(blocks, imgBlk)
+					appendBlocks("user", blocks)
 				}
 			case schema.BlockThinking:
 				// Only replay thinking blocks carrying a genuine Anthropic signature.
@@ -109,7 +107,24 @@ func buildAnthropicMessages(msgs []schema.Message, wireFormat string) []anthropi
 				blk := map[string]any{
 					"type":        "tool_result",
 					"tool_use_id": b.CallID,
-					"content":     b.Output,
+				}
+				if len(b.Images) > 0 {
+					parts := make([]map[string]any, 0, len(b.Images)+1)
+					if b.Output != "" {
+						parts = append(parts, map[string]any{"type": "text", "text": b.Output})
+					}
+					for _, img := range b.Images {
+						if imgBlk := buildAnthropicImageBlock(img); imgBlk != nil {
+							parts = append(parts, imgBlk)
+						}
+					}
+					if len(parts) > 0 {
+						blk["content"] = parts
+					} else {
+						blk["content"] = b.Output
+					}
+				} else {
+					blk["content"] = b.Output
 				}
 				if b.IsError {
 					blk["is_error"] = true
@@ -132,6 +147,33 @@ func buildAnthropicMessages(msgs []schema.Message, wireFormat string) []anthropi
 		}}, out...)
 	}
 	return out
+}
+
+func buildAnthropicImageBlock(img schema.ImageSource) map[string]any {
+	if img.Base64 != "" {
+		mt := img.MediaType
+		if mt == "" {
+			mt = schema.DetectBase64ImageMediaType(img.Base64)
+		}
+		return map[string]any{
+			"type": "image",
+			"source": map[string]any{
+				"type":       "base64",
+				"media_type": mt,
+				"data":       img.Base64,
+			},
+		}
+	}
+	if img.URL != "" {
+		return map[string]any{
+			"type": "image",
+			"source": map[string]any{
+				"type": "url",
+				"url":  img.URL,
+			},
+		}
+	}
+	return nil
 }
 
 // applyConversationCacheBreakpoints sets ephemeral cache_control on up to
@@ -199,21 +241,53 @@ func buildAnthropicTools(defs []schema.ToolDef, hosted []schema.HostedTool, nati
 		}}, out...)
 	}
 
+	seenHosted := map[string]bool{}
 	for _, h := range hosted {
-		switch h.Type {
-		case "web_search", "web_search_20250305":
+		switch strings.TrimSpace(h.Type) {
+		case "web_search", "web_search_20250305", "google_search", "googleSearch":
+			if seenHosted["web_search"] {
+				continue
+			}
+			seenHosted["web_search"] = true
 			obj := map[string]any{"type": "web_search_20250305", "name": "web_search"}
 			for k, v := range h.Config {
 				obj[k] = v
 			}
 			out = append(out, obj)
-		case "web_fetch", "web_fetch_20250910":
+		case "web_search_20260209":
+			if seenHosted["web_search"] {
+				continue
+			}
+			seenHosted["web_search"] = true
+			obj := map[string]any{"type": "web_search_20260209", "name": "web_search"}
+			for k, v := range h.Config {
+				obj[k] = v
+			}
+			out = append(out, obj)
+		case "web_fetch", "web_fetch_20250910", "url_context", "urlContext":
+			if seenHosted["web_fetch"] {
+				continue
+			}
+			seenHosted["web_fetch"] = true
 			hasWebFetch = true
 			obj := map[string]any{"type": "web_fetch_20250910", "name": "web_fetch"}
 			for k, v := range h.Config {
 				obj[k] = v
 			}
 			out = append(out, obj)
+		case "web_fetch_20260209":
+			if seenHosted["web_fetch"] {
+				continue
+			}
+			seenHosted["web_fetch"] = true
+			obj := map[string]any{"type": "web_fetch_20260209", "name": "web_fetch"}
+			for k, v := range h.Config {
+				obj[k] = v
+			}
+			out = append(out, obj)
+		case "x_search", "image_generation", "web_search_preview", "web_search_preview_2025_03_11":
+			// Non-Anthropic hosted tool types are skipped cleanly on Anthropic endpoints.
+			continue
 		default:
 			obj := map[string]any{"type": h.Type}
 			if h.Name != "" {

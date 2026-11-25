@@ -16,28 +16,31 @@ import (
 )
 
 type Config struct {
-	MaxStepsPerTurn        int
-	EnableNativeCache      bool
-	DefaultHostedTools     bool
-	NativeToolSearch       bool // use Anthropic native defer_loading + tool_search_tool_bm25 when on Anthropic
-	AutoCompact            bool // automatically commit durable checkpoints near context window
-	NativeServerCompaction bool // enable provider-native server compaction (Anthropic compact-2026-01-12 / OpenAI context_management)
-	CompactionConfig       compact.Config
-	BaseSystemPrompt       string
+	MaxStepsPerTurn             int
+	EnableNativeCache           bool
+	DefaultHostedTools          bool
+	EnableNativeImageGeneration bool // opt-in OpenAI/Azure Responses native hosted image_generation tool
+	NativeToolSearch            bool // use Anthropic native defer_loading + tool_search_tool_bm25 when on Anthropic
+	AutoCompact                 bool // automatically commit durable checkpoints near context window
+	NativeServerCompaction      bool // enable provider-native server compaction (Anthropic compact-2026-01-12 / OpenAI context_management)
+	CompactionConfig            compact.Config
+	ImageGenerator              provider.ImageGenerator // optional fallback image generator for providers without native imagegen
+	BaseSystemPrompt            string
 }
 
 type TurnRequest struct {
-	ThreadID        string
-	Prompt          string
-	Images          []schema.ImageSource
-	Provider        string // optional per-turn override (supports mid-thread switching!)
-	Model           string // optional per-turn override
-	ReasoningEffort string // optional per-turn override
-	HostedTools     []schema.HostedTool
-	EnableWebSearch *bool
-	MaxOutputTokens int
-	CachedContent   string              // optional Gemini 2.5/3 cachedContent name
-	Heartbeat       func(detail string) // optional liveness callback (e.g. Temporal activity heartbeat)
+	ThreadID              string
+	Prompt                string
+	Images                []schema.ImageSource
+	Provider              string // optional per-turn override (supports mid-thread switching!)
+	Model                 string // optional per-turn override
+	ReasoningEffort       string // optional per-turn override
+	HostedTools           []schema.HostedTool
+	EnableWebSearch       *bool
+	EnableImageGeneration *bool // optional per-turn override for native hosted image_generation (OpenAI/Azure)
+	MaxOutputTokens       int
+	CachedContent         string              // optional Gemini 2.5/3 cachedContent name
+	Heartbeat             func(detail string) // optional liveness callback (e.g. Temporal activity heartbeat)
 }
 
 type TurnResult struct {
@@ -118,6 +121,11 @@ func New(
 	}
 	if toolReg == nil {
 		toolReg = tools.NewRegistry(skillCat, pluginReg)
+	}
+	if cfg.ImageGenerator != nil && !toolReg.Has("generate_image") {
+		tools.RegisterImageGenerationTool(toolReg, tools.ImageGenerationConfig{
+			Fallback: cfg.ImageGenerator,
+		})
 	}
 	return &Engine{
 		cfg:         cfg,
@@ -244,8 +252,11 @@ func (e *Engine) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, erro
 	sysPrompt := e.assembleSystemPrompt(th)
 	modelSpec := schema.LookupModel(th.Provider, th.Model)
 	useNativeToolSearch := e.cfg.NativeToolSearch && modelSpec.SupportsNativeToolSearch && p.WireFormat() == "anthropic_messages"
-	activeTools := e.tools.ActiveToolDefs(useNativeToolSearch)
 	hostedTools := e.resolveHostedTools(th.Provider, req)
+	activeTools := e.tools.ActiveToolDefs(useNativeToolSearch)
+	if usesHostedImageGeneration(th.Provider, p.WireFormat(), hostedTools) {
+		activeTools = omitToolByName(activeTools, "generate_image")
+	}
 	provCompaction := e.buildProviderCompaction(th.Provider, modelSpec)
 
 	var (
@@ -367,17 +378,25 @@ func (e *Engine) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, erro
 					"delta": ch.Text,
 				})
 			case provider.DeltaHostedToolStart:
-				e.publishEvent(runCtx, th.ID, epoch, schema.EventHostedToolActivity, map[string]any{
+				evPayload := map[string]any{
 					"call_id": ch.CallID,
 					"tool":    ch.ToolName,
 					"status":  "running",
-				})
+				}
+				if ch.Detail != "" {
+					evPayload["detail"] = ch.Detail
+				}
+				e.publishEvent(runCtx, th.ID, epoch, schema.EventHostedToolActivity, evPayload)
 			case provider.DeltaHostedToolComplete:
-				e.publishEvent(runCtx, th.ID, epoch, schema.EventHostedToolActivity, map[string]any{
+				evPayload := map[string]any{
 					"call_id": ch.CallID,
 					"tool":    ch.ToolName,
 					"status":  "completed",
-				})
+				}
+				if ch.Detail != "" {
+					evPayload["detail"] = ch.Detail
+				}
+				e.publishEvent(runCtx, th.ID, epoch, schema.EventHostedToolActivity, evPayload)
 			}
 		})
 		if err != nil {
@@ -435,7 +454,11 @@ func (e *Engine) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, erro
 
 		if len(calls) > 0 {
 			heartbeat(fmt.Sprintf("tools:%d", len(calls)))
-			results := e.executeToolCalls(runCtx, th.ID, epoch, calls)
+			toolCtx := tools.WithConversationImages(runCtx, collectConversationImages(visible))
+			if imgGen := e.resolveImageGenerator(p); imgGen != nil {
+				toolCtx = tools.WithActiveImageGenerator(toolCtx, imgGen)
+			}
+			results := e.executeToolCalls(toolCtx, th.ID, epoch, calls)
 			if _, err := e.store.AppendMessage(runCtx, th.ID, schema.Message{
 				TurnEpoch: epoch,
 				Role:      schema.RoleTool,

@@ -99,16 +99,24 @@ func (e *Engine) ResolveAutoCompactThreshold(spec schema.ModelSpec) int64 {
 	return spec.AutoCompactThreshold()
 }
 
-// EstimateTokens provides a fast deterministic token estimate (~4 chars/token)
-// when provider-reported input tokens are not yet available.
+// EstimateTokens provides a fast deterministic token estimate (~4 chars/token
+// plus ~1,000 tokens per attached image) when provider-reported input tokens
+// are not yet available.
 func EstimateTokens(systemPrompt string, msgs []schema.Message) int64 {
 	chars := len(systemPrompt)
+	imageTokens := int64(0)
 	for _, m := range msgs {
 		for _, b := range m.Blocks {
 			chars += len(b.Text) + len(b.Thinking) + len(b.Output) + len(b.Arguments) + len(b.Name)
+			if b.Type == schema.BlockImage && b.Image != nil {
+				imageTokens += 1000
+			}
+			if len(b.Images) > 0 {
+				imageTokens += int64(len(b.Images)) * 1000
+			}
 		}
 	}
-	return int64(chars/4) + 1
+	return int64(chars/4) + imageTokens + 1
 }
 
 // ShouldCompact checks whether lastInputTokens (or estimated tokens) crossed
@@ -349,6 +357,18 @@ func BuildFallbackSummary(msgs []schema.Message) string {
 				if t := strings.TrimSpace(blk.Text); t != "" {
 					line = fmt.Sprintf("%s: %s", m.Role, clipUTF8(t, maxFallbackEntryBytes))
 				}
+			case schema.BlockImage:
+				detail := ""
+				if blk.Text != "" {
+					detail = clipUTF8(strings.TrimSpace(blk.Text), 400)
+				} else if blk.Image != nil && blk.Image.Path != "" {
+					detail = blk.Image.Path
+				}
+				if detail != "" {
+					line = fmt.Sprintf("%s image: %s", m.Role, detail)
+				} else {
+					line = fmt.Sprintf("%s image attached", m.Role)
+				}
 			case schema.BlockToolCall:
 				line = fmt.Sprintf("tool_call(%s): %s", blk.Name, clipUTF8(strings.TrimSpace(string(blk.Arguments)), 400))
 			case schema.BlockToolResult:
@@ -356,7 +376,11 @@ func BuildFallbackSummary(msgs []schema.Message) string {
 				if blk.IsError {
 					status = "error"
 				}
-				line = fmt.Sprintf("tool_result(%s, %s): %s", blk.Name, status, clipUTF8(strings.TrimSpace(blk.Output), 400))
+				suffix := ""
+				if len(blk.Images) > 0 {
+					suffix = fmt.Sprintf(" [%d image(s)]", len(blk.Images))
+				}
+				line = fmt.Sprintf("tool_result(%s, %s): %s%s", blk.Name, status, clipUTF8(strings.TrimSpace(blk.Output), 400), suffix)
 			}
 			if line == "" {
 				continue

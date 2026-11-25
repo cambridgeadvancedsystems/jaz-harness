@@ -13,6 +13,10 @@ Whenever modifying wire protocols, compaction thresholds, prompt caching, tool c
 
 Any intentional divergence from upstream defaults (such as lower quality-preserving compaction limits on 1M/2M-window models) must be explicit, documented below, and overridable in config.
 
+## Native Provider Tool Matrix Maintenance Rule
+
+Whenever adding, renaming, modifying, or removing any provider, native hosted tool (such as `x_search`, `web_search`, `web_fetch`, `googleSearch`, `urlContext`, `image_generation`), or universal multimodal/image tool (`view_image`, `generate_image`, multimodal tool-response encoding), **update the `Native Provider Tool Matrix` section in `README.md` in the same change** so the documented capability table stays 100% accurate with the implementation.
+
 ## Maintained Per-Model Compaction-Threshold Recipe
 
 1M/2M raw context windows suffer noticeable quality degradation ("context rot") and cost spikes long before hitting 85–90% of nominal capacity. `schema/models.go` therefore sets explicit quality-tuned `AutoCompactTokenLimit` defaults aligned with Jaz's overrides and upstream coding agents:
