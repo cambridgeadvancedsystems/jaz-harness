@@ -171,6 +171,17 @@ func TestGenerateImageNativeFallbackAndReferenceInputs(t *testing.T) {
 	if _, err := reg.ExecuteResult(histCtx, "generate_image", json.RawMessage(`{"prompt":"bad","num_last_images_to_include":3}`)); err == nil || !strings.Contains(err.Error(), "only 1 were available") {
 		t.Fatalf("expected history bounds error, got %v", err)
 	}
+
+	// 5. Rejects path traversal or absolute paths in output_path before invoking backend.
+	for _, badPath := range []string{"../escape.png", "/etc/escape.png", "a/../../escape.png"} {
+		args, _ := json.Marshal(map[string]any{"prompt": "bad", "output_path": badPath})
+		if _, err := reg.ExecuteResult(histCtx, "generate_image", args); err == nil {
+			t.Fatalf("expected output_path rejection for %q", badPath)
+		}
+	}
+	if nativeCalls != 1 {
+		t.Fatalf("invalid output_path must fail before invoking image generator, got nativeCalls=%d", nativeCalls)
+	}
 }
 
 func TestMCPImageResultPreservedThroughDeferredCallTool(t *testing.T) {

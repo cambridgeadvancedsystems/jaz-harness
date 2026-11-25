@@ -313,7 +313,7 @@ func (c *Client) Compact(ctx context.Context, req provider.CompactRequest) (prov
 		out.Usage = parsed.Usage.ToSchema()
 	}
 	for _, rawItem := range parsed.Output {
-		itemType := rawItemType(rawItem)
+		itemType := responses.RawItemType(rawItem)
 		if itemType == "configuration_update" {
 			continue
 		}
@@ -329,22 +329,12 @@ func (c *Client) Compact(ctx context.Context, req provider.CompactRequest) (prov
 	return out, nil
 }
 
-func rawItemType(raw json.RawMessage) string {
-	var meta struct {
-		Type string `json:"type"`
-	}
-	if json.Unmarshal(raw, &meta) != nil {
-		return ""
-	}
-	return meta.Type
-}
-
 func stripConfigurationUpdateItems(items []any) []any {
 	out := make([]any, 0, len(items))
 	for _, it := range items {
 		switch v := it.(type) {
 		case json.RawMessage:
-			if rawItemType(v) == "configuration_update" {
+			if responses.RawItemType(v) == "configuration_update" {
 				continue
 			}
 		case map[string]any:

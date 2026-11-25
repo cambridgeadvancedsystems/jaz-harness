@@ -199,26 +199,21 @@ func (c *Client) buildInteractionsRequestBody(req provider.Request) ([]byte, err
 
 	var tools []map[string]any
 	seenHosted := map[string]bool{}
+	appendUnique := func(kind string) {
+		if seenHosted[kind] {
+			return
+		}
+		seenHosted[kind] = true
+		tools = append(tools, map[string]any{"type": kind})
+	}
 	for _, h := range req.HostedTools {
 		switch strings.TrimSpace(h.Type) {
 		case "google_search", "googleSearch", "web_search", "web_search_20250305", "web_search_20260209":
-			if seenHosted["google_search"] {
-				continue
-			}
-			seenHosted["google_search"] = true
-			tools = append(tools, map[string]any{"type": "google_search"})
+			appendUnique("google_search")
 		case "url_context", "urlContext", "web_fetch", "web_fetch_20250910", "web_fetch_20260209":
-			if seenHosted["url_context"] {
-				continue
-			}
-			seenHosted["url_context"] = true
-			tools = append(tools, map[string]any{"type": "url_context"})
+			appendUnique("url_context")
 		case "code_execution", "codeExecution":
-			if seenHosted["code_execution"] {
-				continue
-			}
-			seenHosted["code_execution"] = true
-			tools = append(tools, map[string]any{"type": "code_execution"})
+			appendUnique("code_execution")
 		case "x_search", "image_generation", "web_search_preview", "web_search_preview_2025_03_11":
 			continue
 		default:
@@ -609,14 +604,10 @@ func parseInteractionsSSE(r io.Reader, providerID, fallbackModel string, emit pr
 
 func buildInteractionsImagePart(img schema.ImageSource) map[string]any {
 	if img.Base64 != "" {
-		mt := img.MediaType
-		if mt == "" {
-			mt = schema.DetectBase64ImageMediaType(img.Base64)
-		}
 		return map[string]any{
 			"type":      "image",
 			"data":      img.Base64,
-			"mime_type": mt,
+			"mime_type": img.ResolvedMediaType(),
 		}
 	}
 	if img.URL != "" {

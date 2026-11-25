@@ -308,6 +308,18 @@ func TestOpenAIAndCodexImageGenerationCallContinuityAndImagesAPI(t *testing.T) {
 		t.Fatalf("direct openai multipart edit failed: err=%v ct=%q res=%+v", err, directEditContentType, editRes)
 	}
 
+	// Direct OpenAI GenerateImage with mixed base64 + remote URL falls back cleanly to JSON /v1/images/edits.
+	mixedRes, err := imgGen.GenerateImage(context.Background(), provider.ImageGenerationRequest{
+		Prompt: "Blend both",
+		ReferenceImages: []schema.ImageSource{
+			{MediaType: "image/png", Base64: redB64},
+			{URL: "https://example.com/overlay.png"},
+		},
+	})
+	if err != nil || len(mixedRes.Images) != 1 || directEditContentType != "application/json" {
+		t.Fatalf("direct openai mixed-source edit must use JSON: err=%v ct=%q res=%+v", err, directEditContentType, mixedRes)
+	}
+
 	// Codex OAuth GenerateImage with reference images uses Codex JSON ImageEditRequest on /images/edits.
 	mgr := auth.NewCodexOAuthManager(auth.CodexOAuthConfig{HTTPClient: srv.Client()})
 	mgr.LoadFromMemory(auth.CodexAuthFile{
@@ -367,7 +379,7 @@ func TestAnthropicWebSearchFetchToolUseIDAndMultimodalToolResult(t *testing.T) {
 	res, err := p.Stream(context.Background(), provider.Request{
 		Model: "claude-sonnet-4-5",
 		HostedTools: []schema.HostedTool{
-			{Type: "web_search_20260209"},
+			{Type: "web_search_20260209", Config: map[string]any{"max_uses": 3, "external_web_access": true, "enable_image_understanding": true}},
 			{Type: "web_fetch"},
 			{Type: "x_search"},         // foreign: must be skipped
 			{Type: "image_generation"}, // foreign: must be skipped
@@ -411,7 +423,7 @@ func TestAnthropicWebSearchFetchToolUseIDAndMultimodalToolResult(t *testing.T) {
 			t.Fatalf("anthropic request missing %s\nbody=%s", want, reqBody)
 		}
 	}
-	for _, forbid := range []string{`"x_search"`, `"image_generation"`} {
+	for _, forbid := range []string{`"x_search"`, `"image_generation"`, `"external_web_access"`, `"enable_image_understanding"`} {
 		if strings.Contains(reqBody, forbid) {
 			t.Fatalf("anthropic request must skip %s\nbody=%s", forbid, reqBody)
 		}

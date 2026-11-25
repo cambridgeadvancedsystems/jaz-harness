@@ -195,3 +195,33 @@ func TestHarnessOpenAIHostedImageGenerationSuppressesDuplicateLocalTool(t *testi
 		}
 	}
 }
+
+func TestHarnessVertexAnthropicDefaultsToWebSearchOnly(t *testing.T) {
+	pVA := &scriptedProvider{
+		id:         "vertex_anthropic",
+		wireFormat: "anthropic_messages",
+		responses: []provider.Response{
+			{
+				ID:     "va1",
+				Model:  "claude-sonnet-4-5",
+				Blocks: []schema.ContentBlock{{Type: schema.BlockText, Text: "OK"}},
+			},
+		},
+	}
+	provReg := provider.NewRegistry()
+	provReg.Register("vertex_anthropic", pVA)
+	eng := harness.New(harness.Config{DefaultHostedTools: true}, store.NewMemoryStore(), provReg, nil, nil, nil)
+
+	ctx := context.Background()
+	th, err := eng.CreateThread(ctx, schema.Thread{Provider: "vertex_anthropic", Model: "claude-sonnet-4-5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.RunTurn(ctx, harness.TurnRequest{ThreadID: th.ID, Prompt: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	hosted := pVA.calls[0].HostedTools
+	if len(hosted) != 1 || hosted[0].Type != "web_search_20250305" {
+		t.Fatalf("vertex_anthropic default hosted tools should be web_search_20250305 only, got %+v", hosted)
+	}
+}

@@ -81,17 +81,18 @@ func (c *Client) GenerateImage(ctx context.Context, req provider.ImageGeneration
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, provider.DefaultMaxBodyBytes))
-	if err != nil {
-		return provider.ImageGenerationResponse{}, err
-	}
 	if resp.StatusCode >= 300 {
+		rawErr, _ := io.ReadAll(io.LimitReader(resp.Body, provider.DefaultMaxErrorBodyBytes))
 		return provider.ImageGenerationResponse{}, &provider.APIError{
 			Provider:   c.ID(),
 			StatusCode: resp.StatusCode,
-			Body:       strings.TrimSpace(string(raw)),
+			Body:       strings.TrimSpace(string(rawErr)),
 			RetryAfter: provider.ParseRetryAfter(resp.Header),
 		}
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, provider.DefaultMaxBodyBytes))
+	if err != nil {
+		return provider.ImageGenerationResponse{}, err
 	}
 
 	var parsed struct {

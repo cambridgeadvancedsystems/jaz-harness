@@ -47,6 +47,18 @@ type ImageSource struct {
 	Path      string `json:"path,omitempty"`
 }
 
+// ResolvedMediaType returns the explicit MediaType when set, sniffs inline
+// base64 bytes when available, and otherwise falls back to image/png.
+func (s ImageSource) ResolvedMediaType() string {
+	if mt := strings.TrimSpace(s.MediaType); mt != "" {
+		return mt
+	}
+	if s.Base64 != "" {
+		return DetectBase64ImageMediaType(s.Base64)
+	}
+	return "image/png"
+}
+
 // DataURL returns the image URL directly if set, or formats inline base64 data
 // as an RFC 2397 data URL.
 func (s ImageSource) DataURL() string {
@@ -56,11 +68,22 @@ func (s ImageSource) DataURL() string {
 	if s.Base64 == "" {
 		return ""
 	}
-	mt := s.MediaType
-	if mt == "" {
-		mt = DetectBase64ImageMediaType(s.Base64)
+	return "data:" + s.ResolvedMediaType() + ";base64," + s.Base64
+}
+
+// ImageExtension returns the canonical lowercase filename extension (without
+// leading dot) for common image MIME types.
+func ImageExtension(mediaType string) string {
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "image/jpeg", "image/jpg":
+		return "jpg"
+	case "image/webp":
+		return "webp"
+	case "image/gif":
+		return "gif"
+	default:
+		return "png"
 	}
-	return "data:" + mt + ";base64," + s.Base64
 }
 
 // DetectImageMediaType inspects raw image magic bytes and returns a normalized

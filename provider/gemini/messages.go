@@ -95,6 +95,9 @@ func buildGeminiContents(msgs []schema.Message, wireFormat string) []any {
 			case schema.BlockImage:
 				if b.Image != nil {
 					if imgPart := buildGeminiImagePart(*b.Image); imgPart != nil {
+						if b.Text != "" && m.Role == schema.RoleAssistant {
+							parts = append(parts, map[string]any{"text": "[Generated image prompt: " + b.Text + "]"})
+						}
 						parts = append(parts, imgPart)
 					}
 				}
@@ -164,25 +167,17 @@ func buildGeminiContents(msgs []schema.Message, wireFormat string) []any {
 
 func buildGeminiImagePart(img schema.ImageSource) map[string]any {
 	if img.Base64 != "" {
-		mt := img.MediaType
-		if mt == "" {
-			mt = schema.DetectBase64ImageMediaType(img.Base64)
-		}
 		return map[string]any{
 			"inlineData": map[string]any{
-				"mimeType": mt,
+				"mimeType": img.ResolvedMediaType(),
 				"data":     img.Base64,
 			},
 		}
 	}
 	if img.URL != "" {
-		mt := img.MediaType
-		if mt == "" {
-			mt = "image/png"
-		}
 		return map[string]any{
 			"fileData": map[string]any{
-				"mimeType": mt,
+				"mimeType": img.ResolvedMediaType(),
 				"fileUri":  img.URL,
 			},
 		}
@@ -217,50 +212,31 @@ func buildGeminiTools(defs []schema.ToolDef, hosted []schema.HostedTool) ([]map[
 		tools = append(tools, map[string]any{"functionDeclarations": decls})
 	}
 	seenHosted := map[string]bool{}
+	appendHosted := func(key string, cfg map[string]any, dedupe bool) {
+		if dedupe {
+			if seenHosted[key] {
+				return
+			}
+			seenHosted[key] = true
+		}
+		hasHosted = true
+		if cfg == nil {
+			cfg = map[string]any{}
+		}
+		tools = append(tools, map[string]any{key: cfg})
+	}
 	for _, h := range hosted {
 		switch strings.TrimSpace(h.Type) {
 		case "google_search", "googleSearch", "web_search", "web_search_20250305", "web_search_20260209":
-			if seenHosted["googleSearch"] {
-				continue
-			}
-			seenHosted["googleSearch"] = true
-			hasHosted = true
-			cfg := h.Config
-			if cfg == nil {
-				cfg = map[string]any{}
-			}
-			tools = append(tools, map[string]any{"googleSearch": cfg})
+			appendHosted("googleSearch", h.Config, true)
 		case "url_context", "urlContext", "web_fetch", "web_fetch_20250910", "web_fetch_20260209":
-			if seenHosted["urlContext"] {
-				continue
-			}
-			seenHosted["urlContext"] = true
-			hasHosted = true
-			cfg := h.Config
-			if cfg == nil {
-				cfg = map[string]any{}
-			}
-			tools = append(tools, map[string]any{"urlContext": cfg})
+			appendHosted("urlContext", h.Config, true)
 		case "code_execution", "codeExecution":
-			if seenHosted["codeExecution"] {
-				continue
-			}
-			seenHosted["codeExecution"] = true
-			hasHosted = true
-			cfg := h.Config
-			if cfg == nil {
-				cfg = map[string]any{}
-			}
-			tools = append(tools, map[string]any{"codeExecution": cfg})
+			appendHosted("codeExecution", h.Config, true)
 		case "x_search", "image_generation", "web_search_preview", "web_search_preview_2025_03_11":
 			continue
 		default:
-			hasHosted = true
-			cfg := h.Config
-			if cfg == nil {
-				cfg = map[string]any{}
-			}
-			tools = append(tools, map[string]any{h.Type: cfg})
+			appendHosted(h.Type, h.Config, false)
 		}
 	}
 	return tools, hasFunctions, hasHosted

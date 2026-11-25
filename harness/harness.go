@@ -378,25 +378,9 @@ func (e *Engine) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, erro
 					"delta": ch.Text,
 				})
 			case provider.DeltaHostedToolStart:
-				evPayload := map[string]any{
-					"call_id": ch.CallID,
-					"tool":    ch.ToolName,
-					"status":  "running",
-				}
-				if ch.Detail != "" {
-					evPayload["detail"] = ch.Detail
-				}
-				e.publishEvent(runCtx, th.ID, epoch, schema.EventHostedToolActivity, evPayload)
+				e.publishHostedToolEvent(runCtx, th.ID, epoch, ch, "running")
 			case provider.DeltaHostedToolComplete:
-				evPayload := map[string]any{
-					"call_id": ch.CallID,
-					"tool":    ch.ToolName,
-					"status":  "completed",
-				}
-				if ch.Detail != "" {
-					evPayload["detail"] = ch.Detail
-				}
-				e.publishEvent(runCtx, th.ID, epoch, schema.EventHostedToolActivity, evPayload)
+				e.publishHostedToolEvent(runCtx, th.ID, epoch, ch, "completed")
 			}
 		})
 		if err != nil {
@@ -454,9 +438,12 @@ func (e *Engine) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, erro
 
 		if len(calls) > 0 {
 			heartbeat(fmt.Sprintf("tools:%d", len(calls)))
-			toolCtx := tools.WithConversationImages(runCtx, collectConversationImages(visible))
-			if imgGen := e.resolveImageGenerator(p); imgGen != nil {
-				toolCtx = tools.WithActiveImageGenerator(toolCtx, imgGen)
+			toolCtx := tools.WithConversationImages(runCtx, collectConversationImages(visible, savedBlocks))
+			if nativeGen, ok := p.(provider.ImageGenerator); ok {
+				toolCtx = tools.WithActiveImageGenerator(toolCtx, nativeGen)
+			}
+			if e.cfg.ImageGenerator != nil {
+				toolCtx = tools.WithFallbackImageGenerator(toolCtx, e.cfg.ImageGenerator)
 			}
 			results := e.executeToolCalls(toolCtx, th.ID, epoch, calls)
 			if _, err := e.store.AppendMessage(runCtx, th.ID, schema.Message{

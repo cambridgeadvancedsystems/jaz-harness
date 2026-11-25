@@ -45,7 +45,7 @@ func (c *Client) GenerateImage(ctx context.Context, req provider.ImageGeneration
 		body, err = buildImageGenerateBody(model, prompt, background, req)
 	} else {
 		endpoint = c.cfg.BaseURL + "/images/edits"
-		if c.isCodexOAuth() || !hasBase64Images(req.ReferenceImages) {
+		if c.isCodexOAuth() || !allHaveInlineImageBytes(req.ReferenceImages) {
 			contentType = "application/json"
 			body, err = buildImageEditJSONBody(model, prompt, background, req)
 		} else {
@@ -62,17 +62,18 @@ func (c *Client) GenerateImage(ctx context.Context, req provider.ImageGeneration
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, provider.DefaultMaxBodyBytes))
-	if err != nil {
-		return provider.ImageGenerationResponse{}, err
-	}
 	if resp.StatusCode >= 300 {
+		rawErr, _ := io.ReadAll(io.LimitReader(resp.Body, provider.DefaultMaxErrorBodyBytes))
 		return provider.ImageGenerationResponse{}, &provider.APIError{
 			Provider:   c.ID(),
 			StatusCode: resp.StatusCode,
-			Body:       strings.TrimSpace(string(raw)),
+			Body:       strings.TrimSpace(string(rawErr)),
 			RetryAfter: provider.ParseRetryAfter(resp.Header),
 		}
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, provider.DefaultMaxBodyBytes))
+	if err != nil {
+		return provider.ImageGenerationResponse{}, err
 	}
 
 	var parsed struct {
@@ -197,31 +198,38 @@ func buildImageEditJSONBody(model, prompt, background string, req provider.Image
 	return json.Marshal(payload)
 }
 
-func hasBase64Images(refs []schema.ImageSource) bool {
+func allHaveInlineImageBytes(refs []schema.ImageSource) bool {
+	if len(refs) == 0 {
+		return false
+	}
 	for _, r := range refs {
-		if strings.TrimSpace(r.Base64) != "" {
-			return true
+		if strings.TrimSpace(r.Base64) == "" && !strings.HasPrefix(r.URL, "data:") {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func buildImageEditMultipartBody(model, prompt, background string, req provider.ImageGenerationRequest) ([]byte, string, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
-	_ = mw.WriteField("model", model)
-	_ = mw.WriteField("prompt", prompt)
-	if background != "" {
-		_ = mw.WriteField("background", background)
+	writeField := func(name, val string) error {
+		if val == "" {
+			return nil
+		}
+		return mw.WriteField(name, val)
 	}
-	if req.Quality != "" {
-		_ = mw.WriteField("quality", strings.ToLower(strings.TrimSpace(req.Quality)))
-	}
-	if req.Size != "" {
-		_ = mw.WriteField("size", strings.TrimSpace(req.Size))
-	}
-	if req.InputFidelity != "" {
-		_ = mw.WriteField("input_fidelity", strings.ToLower(strings.TrimSpace(req.InputFidelity)))
+	for _, kv := range [][2]string{
+		{"model", model},
+		{"prompt", prompt},
+		{"background", background},
+		{"quality", strings.ToLower(strings.TrimSpace(req.Quality))},
+		{"size", strings.TrimSpace(req.Size)},
+		{"input_fidelity", strings.ToLower(strings.TrimSpace(req.InputFidelity))},
+	} {
+		if err := writeField(kv[0], kv[1]); err != nil {
+			return nil, "", err
+		}
 	}
 	fieldName := "image[]"
 	if len(req.ReferenceImages) == 1 {
@@ -233,7 +241,7 @@ func buildImageEditMultipartBody(model, prompt, background string, req provider.
 		if err != nil {
 			return nil, "", fmt.Errorf("openai image edit reference %d: %w", i, err)
 		}
-		ext := extensionForMediaType(mt)
+		ext := schema.ImageExtension(mt)
 		hdr := make(textproto.MIMEHeader)
 		hdr.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="reference_%d.%s"`, fieldName, i, ext))
 		hdr.Set("Content-Type", mt)
@@ -277,17 +285,4 @@ func decodeReferenceImageBytes(ref schema.ImageSource) ([]byte, string, error) {
 		mt = "image/png"
 	}
 	return raw, mt, nil
-}
-
-func extensionForMediaType(mt string) string {
-	switch strings.ToLower(strings.TrimSpace(mt)) {
-	case "image/jpeg", "image/jpg":
-		return "jpg"
-	case "image/webp":
-		return "webp"
-	case "image/gif":
-		return "gif"
-	default:
-		return "png"
-	}
 }

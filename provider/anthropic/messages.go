@@ -151,15 +151,11 @@ func buildAnthropicMessages(msgs []schema.Message, wireFormat string) []anthropi
 
 func buildAnthropicImageBlock(img schema.ImageSource) map[string]any {
 	if img.Base64 != "" {
-		mt := img.MediaType
-		if mt == "" {
-			mt = schema.DetectBase64ImageMediaType(img.Base64)
-		}
 		return map[string]any{
 			"type": "image",
 			"source": map[string]any{
 				"type":       "base64",
-				"media_type": mt,
+				"media_type": img.ResolvedMediaType(),
 				"data":       img.Base64,
 			},
 		}
@@ -242,64 +238,56 @@ func buildAnthropicTools(defs []schema.ToolDef, hosted []schema.HostedTool, nati
 	}
 
 	seenHosted := map[string]bool{}
+	appendHosted := func(slot, wireType, name string, cfg map[string]any, filterForeign bool) {
+		if slot != "" {
+			if seenHosted[slot] {
+				return
+			}
+			seenHosted[slot] = true
+		}
+		obj := map[string]any{"type": wireType}
+		if name != "" {
+			obj["name"] = name
+		}
+		for k, v := range cfg {
+			if filterForeign && isForeignAnthropicToolConfigKey(k) {
+				continue
+			}
+			obj[k] = v
+		}
+		out = append(out, obj)
+	}
 	for _, h := range hosted {
 		switch strings.TrimSpace(h.Type) {
 		case "web_search", "web_search_20250305", "google_search", "googleSearch":
-			if seenHosted["web_search"] {
-				continue
-			}
-			seenHosted["web_search"] = true
-			obj := map[string]any{"type": "web_search_20250305", "name": "web_search"}
-			for k, v := range h.Config {
-				obj[k] = v
-			}
-			out = append(out, obj)
+			appendHosted("web_search", "web_search_20250305", "web_search", h.Config, true)
 		case "web_search_20260209":
-			if seenHosted["web_search"] {
-				continue
-			}
-			seenHosted["web_search"] = true
-			obj := map[string]any{"type": "web_search_20260209", "name": "web_search"}
-			for k, v := range h.Config {
-				obj[k] = v
-			}
-			out = append(out, obj)
+			appendHosted("web_search", "web_search_20260209", "web_search", h.Config, true)
 		case "web_fetch", "web_fetch_20250910", "url_context", "urlContext":
-			if seenHosted["web_fetch"] {
-				continue
+			if !seenHosted["web_fetch"] {
+				hasWebFetch = true
 			}
-			seenHosted["web_fetch"] = true
-			hasWebFetch = true
-			obj := map[string]any{"type": "web_fetch_20250910", "name": "web_fetch"}
-			for k, v := range h.Config {
-				obj[k] = v
-			}
-			out = append(out, obj)
+			appendHosted("web_fetch", "web_fetch_20250910", "web_fetch", h.Config, true)
 		case "web_fetch_20260209":
-			if seenHosted["web_fetch"] {
-				continue
-			}
-			seenHosted["web_fetch"] = true
-			obj := map[string]any{"type": "web_fetch_20260209", "name": "web_fetch"}
-			for k, v := range h.Config {
-				obj[k] = v
-			}
-			out = append(out, obj)
+			appendHosted("web_fetch", "web_fetch_20260209", "web_fetch", h.Config, true)
 		case "x_search", "image_generation", "web_search_preview", "web_search_preview_2025_03_11":
-			// Non-Anthropic hosted tool types are skipped cleanly on Anthropic endpoints.
 			continue
 		default:
-			obj := map[string]any{"type": h.Type}
-			if h.Name != "" {
-				obj["name"] = h.Name
-			}
-			for k, v := range h.Config {
-				obj[k] = v
-			}
-			out = append(out, obj)
+			appendHosted("", h.Type, h.Name, h.Config, false)
 		}
 	}
 	return out, hasWebFetch, hasDeferred
+}
+
+func isForeignAnthropicToolConfigKey(key string) bool {
+	switch key {
+	case "external_web_access", "search_context_size",
+		"allowed_x_handles", "excluded_x_handles", "from_date", "to_date",
+		"enable_image_understanding", "enable_video_understanding":
+		return true
+	default:
+		return false
+	}
 }
 
 func buildAnthropicToolChoice(tc *schema.ToolChoice) map[string]any {

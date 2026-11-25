@@ -191,6 +191,18 @@ func (e *Engine) assembleSystemPrompt(th schema.Thread) string {
 	return strings.Join(parts, "\n\n")
 }
 
+func (e *Engine) publishHostedToolEvent(ctx context.Context, threadID string, epoch int64, ch provider.StreamChunk, status string) {
+	evPayload := map[string]any{
+		"call_id": ch.CallID,
+		"tool":    ch.ToolName,
+		"status":  status,
+	}
+	if ch.Detail != "" {
+		evPayload["detail"] = ch.Detail
+	}
+	e.publishEvent(ctx, threadID, epoch, schema.EventHostedToolActivity, evPayload)
+}
+
 func (e *Engine) resolveHostedTools(providerName string, req TurnRequest) []schema.HostedTool {
 	if len(req.HostedTools) > 0 {
 		return req.HostedTools
@@ -210,11 +222,13 @@ func (e *Engine) resolveHostedTools(providerName string, req TurnRequest) []sche
 		switch norm {
 		case "openai", "codex_oauth", "azure_openai":
 			out = append(out, schema.HostedTool{Type: "web_search"})
-		case "anthropic", "vertex_anthropic", "bedrock_anthropic":
+		case "anthropic":
 			out = append(out,
 				schema.HostedTool{Type: "web_search_20250305", Name: "web_search"},
 				schema.HostedTool{Type: "web_fetch_20250910", Name: "web_fetch"},
 			)
+		case "vertex_anthropic", "bedrock_anthropic":
+			out = append(out, schema.HostedTool{Type: "web_search_20250305", Name: "web_search"})
 		case "grok", "xai":
 			out = append(out,
 				schema.HostedTool{Type: "x_search", Config: map[string]any{"enable_image_understanding": true}},
@@ -234,15 +248,6 @@ func (e *Engine) resolveHostedTools(providerName string, req TurnRequest) []sche
 		}
 	}
 	return out
-}
-
-func (e *Engine) resolveImageGenerator(active provider.Provider) provider.ImageGenerator {
-	if active != nil {
-		if gen, ok := active.(provider.ImageGenerator); ok {
-			return gen
-		}
-	}
-	return e.cfg.ImageGenerator
 }
 
 func usesHostedImageGeneration(providerName, wireFormat string, hosted []schema.HostedTool) bool {
@@ -271,10 +276,10 @@ func omitToolByName(defs []schema.ToolDef, name string) []schema.ToolDef {
 	return out
 }
 
-func collectConversationImages(msgs []schema.Message) []schema.ImageSource {
+func collectConversationImages(msgs []schema.Message, currentStepBlocks []schema.ContentBlock) []schema.ImageSource {
 	var imgs []schema.ImageSource
-	for _, m := range msgs {
-		for _, b := range m.Blocks {
+	appendFromBlocks := func(blocks []schema.ContentBlock) {
+		for _, b := range blocks {
 			if b.Type == schema.BlockImage && b.Image != nil && b.Image.DataURL() != "" {
 				imgs = append(imgs, *b.Image)
 			}
@@ -285,6 +290,10 @@ func collectConversationImages(msgs []schema.Message) []schema.ImageSource {
 			}
 		}
 	}
+	for _, m := range msgs {
+		appendFromBlocks(m.Blocks)
+	}
+	appendFromBlocks(currentStepBlocks)
 	return imgs
 }
 

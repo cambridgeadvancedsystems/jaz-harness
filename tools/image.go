@@ -213,6 +213,12 @@ func RegisterImageGenerationTool(reg *Registry, cfg ImageGenerationConfig) {
 		if p.Prompt == "" {
 			return Result{}, errors.New("generate_image: prompt is required")
 		}
+		requestedOutputPath := strings.TrimSpace(p.OutputPath)
+		if requestedOutputPath != "" {
+			if err := validateRelativeOutputPath(requestedOutputPath); err != nil {
+				return Result{}, err
+			}
+		}
 		if len(p.ReferencedImagePaths) > 0 && p.NumLastImagesToInclude != nil {
 			return Result{}, errors.New("provide only one of `referenced_image_paths` or `num_last_images_to_include`")
 		}
@@ -314,7 +320,7 @@ func RegisterImageGenerationTool(reg *Registry, cfg ImageGenerationConfig) {
 					img.MediaType = "image/png"
 				}
 			}
-			targetPath := buildGeneratedImagePath(outDir, strings.TrimSpace(p.OutputPath), callID, i, len(genResp.Images), img.MediaType)
+			targetPath := buildGeneratedImagePath(outDir, requestedOutputPath, callID, i, len(genResp.Images), img.MediaType)
 			if werr := cfg.WriteFile(ctx, targetPath, decoded); werr == nil {
 				img.Path = targetPath
 				savedPaths = append(savedPaths, targetPath)
@@ -355,28 +361,36 @@ func RegisterImageGenerationTool(reg *Registry, cfg ImageGenerationConfig) {
 
 func resolveImageBackend(ctx context.Context, cfg ImageGenerationConfig) provider.ImageGenerator {
 	active := ActiveImageGeneratorFromContext(ctx)
+	fallback := cfg.Fallback
+	if fallback == nil {
+		fallback = FallbackImageGeneratorFromContext(ctx)
+	}
 	if cfg.PreferFallback {
-		if cfg.Fallback != nil {
-			return cfg.Fallback
+		if fallback != nil {
+			return fallback
 		}
 		return active
 	}
 	if active != nil {
 		return active
 	}
-	return cfg.Fallback
+	return fallback
+}
+
+func validateRelativeOutputPath(raw string) error {
+	norm := strings.ReplaceAll(raw, "\\", "/")
+	if strings.HasPrefix(norm, "/") {
+		return errors.New("generate_image: output_path must be a relative workspace path")
+	}
+	clean := path.Clean(norm)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return errors.New("generate_image: output_path must stay within the workspace")
+	}
+	return nil
 }
 
 func buildGeneratedImagePath(outDir, requestedPath, callID string, idx, total int, mediaType string) string {
-	ext := ".png"
-	switch strings.ToLower(strings.TrimSpace(mediaType)) {
-	case "image/jpeg", "image/jpg":
-		ext = ".jpg"
-	case "image/webp":
-		ext = ".webp"
-	case "image/gif":
-		ext = ".gif"
-	}
+	ext := "." + schema.ImageExtension(mediaType)
 	if requestedPath != "" {
 		clean := path.Clean(strings.ReplaceAll(requestedPath, "\\", "/"))
 		if total <= 1 {

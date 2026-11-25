@@ -40,6 +40,7 @@ type ctxKey int
 const (
 	ctxKeyConversationImages ctxKey = iota + 1
 	ctxKeyActiveImageGenerator
+	ctxKeyFallbackImageGenerator
 	ctxKeyToolCallID
 )
 
@@ -58,6 +59,15 @@ func WithActiveImageGenerator(ctx context.Context, gen provider.ImageGenerator) 
 
 func ActiveImageGeneratorFromContext(ctx context.Context) provider.ImageGenerator {
 	gen, _ := ctx.Value(ctxKeyActiveImageGenerator).(provider.ImageGenerator)
+	return gen
+}
+
+func WithFallbackImageGenerator(ctx context.Context, gen provider.ImageGenerator) context.Context {
+	return context.WithValue(ctx, ctxKeyFallbackImageGenerator, gen)
+}
+
+func FallbackImageGeneratorFromContext(ctx context.Context) provider.ImageGenerator {
+	gen, _ := ctx.Value(ctxKeyFallbackImageGenerator).(provider.ImageGenerator)
 	return gen
 }
 
