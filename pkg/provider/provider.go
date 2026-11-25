@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -49,20 +50,21 @@ type Request struct {
 	Temperature       *float64
 	TopP              *float64
 	CacheKey          string
-	CachedContentName string // Gemini explicit cachedContents resource name
+	CachedContentName string // Gemini 2.5/3 explicit cachedContents resource name (omitted on Gemini 4)
 	EnableNativeCache bool
-	NativeToolSearch  bool   // Anthropic native defer_loading + tool_search_tool_bm25
-	EnableCompaction  bool   // Anthropic native server compaction beta
+	NativeToolSearch  bool // Anthropic native defer_loading + tool_search_tool_bm25
+	EnableCompaction  bool // Anthropic native server compaction beta
 	Metadata          map[string]string
 }
 
 type Response struct {
-	ID         string
-	Model      string
-	Blocks     []schema.ContentBlock
-	Native     *schema.NativeEnvelope
-	Usage      schema.Usage
-	StopReason string
+	ID                string
+	Model             string
+	Blocks            []schema.ContentBlock
+	Native            *schema.NativeEnvelope
+	Usage             schema.Usage
+	StopReason        string
+	ContinuationToken string // Gemini 4 long-decode continuation token when status requires continuation
 }
 
 type CompactRequest struct {
@@ -129,8 +131,33 @@ func ParseRetryAfter(h http.Header) time.Duration {
 	return 0
 }
 
+// SanitizeToolArgsJSON guarantees valid JSON object text for tool arguments so
+// malformed model emissions never cause HTTP 400 errors on replay turns.
+func SanitizeToolArgsJSON(raw []byte) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "{}"
+	}
+	if json.Valid(trimmed) {
+		return string(trimmed)
+	}
+	return "{}"
+}
+
+// DecodeToolArgsObject parses raw tool arguments into a JSON object map,
+// falling back to an empty object on malformed JSON.
+func DecodeToolArgsObject(raw []byte) map[string]any {
+	clean := SanitizeToolArgsJSON(raw)
+	var obj map[string]any
+	if json.Unmarshal([]byte(clean), &obj) == nil && obj != nil {
+		return obj
+	}
+	return map[string]any{}
+}
+
 // DoWithRetry executes an HTTP request builder with bounded exponential backoff
-// on transient 429/5xx errors while respecting Retry-After and context cancellation.
+// on transient 429/529/5xx errors while respecting Retry-After, x-should-retry,
+// and context cancellation.
 func DoWithRetry(ctx context.Context, maxAttempts int, fn func(attempt int) (*http.Response, error)) (*http.Response, error) {
 	if maxAttempts <= 0 {
 		maxAttempts = 3
@@ -140,6 +167,9 @@ func DoWithRetry(ctx context.Context, maxAttempts int, fn func(attempt int) (*ht
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		resp, err := fn(attempt)
 		if err == nil {
+			if strings.EqualFold(strings.TrimSpace(resp.Header.Get("x-should-retry")), "false") {
+				return resp, nil
+			}
 			if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != 529 && resp.StatusCode < 500 {
 				return resp, nil
 			}

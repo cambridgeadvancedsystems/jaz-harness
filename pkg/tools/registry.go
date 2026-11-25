@@ -22,9 +22,9 @@ type entry struct {
 }
 
 // Registry manages core (always-loaded) tools and deferred tools, providing:
-// 1. Universal static gateway (`search_tools`, `call_tool`, `plugins_search`, `skills_read`)
-//    that works across every LLM provider without mutating tool schemas (0 KV cache bust).
-// 2. Native Anthropic `defer_loading: true` + `tool_search_tool_bm25` projection when enabled.
+//  1. Universal static gateway (`search_tools`, `call_tool`, `plugins_search`, `skills_read`)
+//     that works across every LLM provider without mutating tool schemas (0 KV cache bust).
+//  2. Native Anthropic `defer_loading: true` + `tool_search_tool_bm25` projection when enabled.
 type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]entry

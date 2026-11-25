@@ -181,3 +181,55 @@ func TestEndToEndMultiProviderSwitchCompactionAndFilePersistence(t *testing.T) {
 		t.Fatalf("expected compacted checkpoint as first visible message, got %+v", lastClaudeCall.Messages[0])
 	}
 }
+
+func TestHeartbeatAndGeminiContinuationLoop(t *testing.T) {
+	pGem := &scriptedProvider{
+		id:         "vertex",
+		wireFormat: "gemini_interactions",
+		responses: []provider.Response{
+			{
+				ID:                "i1",
+				Model:             "gemini-4-neon",
+				Blocks:            []schema.ContentBlock{{Type: schema.BlockText, Text: "First half. "}},
+				StopReason:        "requires_continuation",
+				ContinuationToken: "tok_part2",
+			},
+			{
+				ID:         "i2",
+				Model:      "gemini-4-neon",
+				Blocks:     []schema.ContentBlock{{Type: schema.BlockText, Text: "Second half."}},
+				StopReason: "completed",
+			},
+		},
+	}
+
+	provReg := provider.NewRegistry()
+	provReg.Register("vertex", pGem)
+	eng := harness.New(harness.Config{}, store.NewMemoryStore(), provReg, nil, nil, nil)
+	ctx := context.Background()
+	th, err := eng.CreateThread(ctx, schema.Thread{Provider: "vertex", Model: "gemini-4-neon"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var beats []string
+	res, err := eng.RunTurn(ctx, harness.TurnRequest{
+		ThreadID: th.ID,
+		Prompt:   "Generate long output",
+		Heartbeat: func(detail string) {
+			beats = append(beats, detail)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Steps != 2 || res.AssistantText != "First half. Second half." {
+		t.Fatalf("expected 2-step continuation, got steps=%d text=%q", res.Steps, res.AssistantText)
+	}
+	if len(pGem.calls) != 2 || pGem.calls[1].Metadata["continuation_token"] != "tok_part2" {
+		t.Fatalf("expected second call to carry continuation_token, got %+v", pGem.calls[1].Metadata)
+	}
+	if len(beats) < 3 {
+		t.Fatalf("expected heartbeat callbacks during stream and continuation, got %v", beats)
+	}
+}

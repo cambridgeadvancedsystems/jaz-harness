@@ -28,9 +28,9 @@ const (
 // CodexAuthFile matches ~/.codex/auth.json so credentials interoperate seamlessly
 // with the official Codex CLI and Jaz Cloud ACP profiles.
 type CodexAuthFile struct {
-	OpenAIAPIKey string           `json:"OPENAI_API_KEY,omitempty"`
-	Tokens       *CodexTokenSet   `json:"tokens,omitempty"`
-	LastRefresh  *time.Time       `json:"last_refresh,omitempty"`
+	OpenAIAPIKey string         `json:"OPENAI_API_KEY,omitempty"`
+	Tokens       *CodexTokenSet `json:"tokens,omitempty"`
+	LastRefresh  *time.Time     `json:"last_refresh,omitempty"`
 }
 
 type CodexTokenSet struct {

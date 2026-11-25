@@ -107,15 +107,11 @@ func BuildInputItems(msgs []schema.Message, wireFormat string) []any {
 					})
 				}
 			case schema.BlockToolCall:
-				args := strings.TrimSpace(string(b.Arguments))
-				if args == "" {
-					args = "{}"
-				}
 				out = append(out, map[string]any{
 					"type":      "function_call",
 					"call_id":   b.CallID,
 					"name":      b.Name,
-					"arguments": args,
+					"arguments": provider.SanitizeToolArgsJSON(b.Arguments),
 				})
 			case schema.BlockToolResult:
 				out = append(out, map[string]any{
@@ -262,7 +258,7 @@ func ParseSSE(r io.Reader, d Dialect, fallbackModel string, emit provider.Stream
 				if json.Unmarshal(ev.Item, &meta) == nil {
 					if meta.Type == "function_call" && !isHosted(meta.CallID, meta.Name) {
 						emit(provider.StreamChunk{Kind: provider.DeltaToolCallStart, CallID: meta.CallID, ToolName: meta.Name})
-					} else if meta.Type == "web_search_call" || meta.Type == "custom_tool_call" || isHosted(meta.CallID, meta.Name) {
+					} else if meta.Type == "web_search_call" || meta.Type == "custom_tool_call" || meta.Type == "code_interpreter_call" || isHosted(meta.CallID, meta.Name) {
 						cid := meta.CallID
 						if cid == "" {
 							cid = meta.ID
@@ -410,17 +406,13 @@ func decodeOutputItem(raw json.RawMessage, isHosted func(callID, name string) bo
 				ProviderOpaque: append(json.RawMessage(nil), raw...),
 			}}
 		}
-		args := strings.TrimSpace(item.Arguments)
-		if args == "" {
-			args = "{}"
-		}
 		return []schema.ContentBlock{{
 			Type:      schema.BlockToolCall,
 			CallID:    item.CallID,
 			Name:      item.Name,
-			Arguments: json.RawMessage(args),
+			Arguments: json.RawMessage(provider.SanitizeToolArgsJSON([]byte(item.Arguments))),
 		}}
-	case "web_search_call", "custom_tool_call":
+	case "web_search_call", "custom_tool_call", "code_interpreter_call":
 		cid := item.CallID
 		if cid == "" {
 			cid = item.ID

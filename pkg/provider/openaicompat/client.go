@@ -373,10 +373,7 @@ func parseChatSSE(r io.Reader, providerID, fallbackModel string, emit provider.S
 	sort.Ints(indices)
 	for _, idx := range indices {
 		acc := calls[idx]
-		args := strings.TrimSpace(acc.args.String())
-		if args == "" {
-			args = "{}"
-		}
+		args := provider.SanitizeToolArgsJSON([]byte(acc.args.String()))
 		blocks = append(blocks, schema.ContentBlock{
 			Type:      schema.BlockToolCall,
 			CallID:    acc.id,
@@ -421,16 +418,12 @@ func buildChatMessages(systemPrompt string, msgs []schema.Message) []map[string]
 					textParts = append(textParts, b.Text)
 				}
 			case schema.BlockToolCall:
-				args := strings.TrimSpace(string(b.Arguments))
-				if args == "" {
-					args = "{}"
-				}
 				toolCalls = append(toolCalls, map[string]any{
 					"id":   b.CallID,
 					"type": "function",
 					"function": map[string]any{
 						"name":      b.Name,
-						"arguments": args,
+						"arguments": provider.SanitizeToolArgsJSON(b.Arguments),
 					},
 				})
 			case schema.BlockToolResult:

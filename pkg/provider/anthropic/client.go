@@ -1,7 +1,6 @@
 package anthropic
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,13 +9,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/auth"
 	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/provider"
-	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/schema"
 )
 
 const (
@@ -30,6 +27,7 @@ const (
 	BetaCompaction       = "compact-2026-01-12"
 	BetaInterleavedThink = "interleaved-thinking-2025-05-14"
 	defaultMaxTokens     = 8192
+	maxCacheBreakpoints  = 4
 )
 
 type Mode string
@@ -46,12 +44,15 @@ type Config struct {
 	ProviderID     string // "anthropic" | "vertex_anthropic" | "bedrock_anthropic"
 	Mode           Mode
 	BaseURL        string
-	APIKey         string
+	APIKey         string // Anthropic API key, or relay Bearer token when BearerAuth/RelayMode is true
+	BearerAuth     bool   // Send Authorization: Bearer instead of x-api-key (for OAuth or LLM relays)
+	RelayMode      bool   // Talk through a native LLM relay using Bearer auth without requiring VertexProject
 	VertexProject  string
 	VertexLocation string
 	VertexToken    TokenSource
 	AWS            auth.AWSCredentials
 	APIVersion     string
+	ExtraHeaders   map[string]string
 	HTTPClient     *http.Client
 	Now            func() time.Time
 }
@@ -127,20 +128,12 @@ func New(cfg Config) *Client {
 func (c *Client) ID() string         { return c.cfg.ProviderID }
 func (c *Client) WireFormat() string { return WireFormat }
 
-type anthropicMessage struct {
-	Role    string           `json:"role"`
-	Content []map[string]any `json:"content"`
-}
-
 func (c *Client) buildRequestBody(req provider.Request) ([]byte, []string, error) {
 	if strings.TrimSpace(req.Model) == "" {
 		return nil, nil, errors.New("anthropic: model is required")
 	}
 	enableCache := req.EnableNativeCache
 	messages := buildAnthropicMessages(req.Messages, WireFormat)
-	if enableCache {
-		applyConversationCacheBreakpoints(messages)
-	}
 
 	var betas []string
 	addBeta := func(b string) {
@@ -159,8 +152,18 @@ func (c *Client) buildRequestBody(req provider.Request) ([]byte, []string, error
 	if hasDeferred {
 		addBeta(BetaAdvancedToolUse)
 	}
-	if len(tools) > 0 && enableCache {
+
+	usedBreakpoints := 0
+	if enableCache && strings.TrimSpace(req.SystemPrompt) != "" {
+		usedBreakpoints++
+	}
+	if enableCache && len(tools) > 0 && usedBreakpoints < maxCacheBreakpoints {
 		tools[len(tools)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
+		usedBreakpoints++
+	}
+	if enableCache {
+		remaining := maxCacheBreakpoints - usedBreakpoints
+		applyConversationCacheBreakpoints(messages, remaining)
 	}
 
 	maxTokens := req.MaxOutputTokens
@@ -187,13 +190,14 @@ func (c *Client) buildRequestBody(req provider.Request) ([]byte, []string, error
 		"max_tokens": maxTokens,
 		"messages":   messages,
 	}
-	if c.cfg.Mode == ModeDirect {
+	switch c.cfg.Mode {
+	case ModeDirect:
 		out["model"] = req.Model
 		out["stream"] = true
-	} else if c.cfg.Mode == ModeVertex {
+	case ModeVertex:
 		out["anthropic_version"] = c.cfg.APIVersion
 		out["stream"] = true
-	} else if c.cfg.Mode == ModeBedrock {
+	case ModeBedrock:
 		out["anthropic_version"] = c.cfg.APIVersion
 	}
 
@@ -242,12 +246,12 @@ func (c *Client) endpointForModel(model string) (string, error) {
 		}
 		return c.cfg.BaseURL + "/v1/messages", nil
 	case ModeVertex:
+		if c.cfg.RelayMode || strings.Contains(c.cfg.BaseURL, "/publishers/anthropic") {
+			return fmt.Sprintf("%s/models/%s:streamRawPredict", c.cfg.BaseURL, url.PathEscape(model)), nil
+		}
 		loc := c.cfg.VertexLocation
 		if loc == "" {
 			loc = "us-east5"
-		}
-		if strings.Contains(c.cfg.BaseURL, "/publishers/anthropic") {
-			return fmt.Sprintf("%s/models/%s:streamRawPredict", c.cfg.BaseURL, url.PathEscape(model)), nil
 		}
 		if c.cfg.VertexProject == "" {
 			return "", errors.New("vertex_anthropic: VertexProject is required")
@@ -282,23 +286,36 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, emit provider
 			return nil, rerr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
+		for k, v := range c.cfg.ExtraHeaders {
+			httpReq.Header.Set(k, v)
+		}
 		switch c.cfg.Mode {
 		case ModeDirect:
-			httpReq.Header.Set("x-api-key", c.cfg.APIKey)
+			if c.cfg.BearerAuth || c.cfg.RelayMode {
+				if c.cfg.APIKey != "" {
+					httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+				}
+			} else if c.cfg.APIKey != "" {
+				httpReq.Header.Set("x-api-key", c.cfg.APIKey)
+			}
 			httpReq.Header.Set("anthropic-version", c.cfg.APIVersion)
 			httpReq.Header.Set("Accept", "text/event-stream")
 			if len(betas) > 0 {
 				httpReq.Header.Set("anthropic-beta", strings.Join(betas, ","))
 			}
 		case ModeVertex:
-			if c.cfg.VertexToken == nil {
-				return nil, errors.New("vertex_anthropic: VertexToken source not configured")
+			if c.cfg.RelayMode && c.cfg.APIKey != "" {
+				httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+			} else {
+				if c.cfg.VertexToken == nil {
+					return nil, errors.New("vertex_anthropic: VertexToken source not configured")
+				}
+				tok, terr := c.cfg.VertexToken(ctx)
+				if terr != nil {
+					return nil, terr
+				}
+				httpReq.Header.Set("Authorization", "Bearer "+tok)
 			}
-			tok, terr := c.cfg.VertexToken(ctx)
-			if terr != nil {
-				return nil, terr
-			}
-			httpReq.Header.Set("Authorization", "Bearer "+tok)
 			httpReq.Header.Set("Accept", "text/event-stream")
 			if len(betas) > 0 {
 				httpReq.Header.Set("anthropic-beta", strings.Join(betas, ","))
@@ -336,578 +353,4 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, emit provider
 		return provider.Response{}, err
 	}
 	return acc.finish(), nil
-}
-
-func readAnthropicSSE(r io.Reader, onEvent func([]byte) error) error {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" {
-			continue
-		}
-		if err := onEvent([]byte(data)); err != nil {
-			return err
-		}
-	}
-	return sc.Err()
-}
-
-type blockAcc struct {
-	blockType    string
-	id           string
-	name         string
-	initialInput string
-	textBuf      strings.Builder
-	thinkingBuf  strings.Builder
-	sigBuf       strings.Builder
-	inputBuf     strings.Builder
-	redactedData string
-	rawServer    json.RawMessage
-	citations    []schema.Citation
-}
-
-type anthropicStreamAcc struct {
-	providerID string
-	respID     string
-	model      string
-	stopReason string
-	usage      schema.Usage
-	blocks     map[int]*blockAcc
-	emit       provider.StreamCallback
-}
-
-func newAnthropicStreamAcc(providerID, model string, emit provider.StreamCallback) *anthropicStreamAcc {
-	return &anthropicStreamAcc{
-		providerID: providerID,
-		model:      model,
-		blocks:     make(map[int]*blockAcc),
-		emit:       emit,
-	}
-}
-
-func (a *anthropicStreamAcc) handleJSONEvent(raw []byte) error {
-	var ev struct {
-		Type    string `json:"type"`
-		Index   int    `json:"index"`
-		Message *struct {
-			ID    string `json:"id"`
-			Model string `json:"model"`
-			Usage *struct {
-				InputTokens              int64 `json:"input_tokens"`
-				CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
-				CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
-				OutputTokens             int64 `json:"output_tokens"`
-			} `json:"usage"`
-		} `json:"message"`
-		ContentBlock json.RawMessage `json:"content_block"`
-		Delta        *struct {
-			Type        string `json:"type"`
-			Text        string `json:"text"`
-			Thinking    string `json:"thinking"`
-			Signature   string `json:"signature"`
-			PartialJSON string `json:"partial_json"`
-			StopReason  string `json:"stop_reason"`
-			Citation    *struct {
-				Type      string `json:"type"`
-				URL       string `json:"url"`
-				Title     string `json:"title"`
-				CitedText string `json:"cited_text"`
-			} `json:"citation"`
-		} `json:"delta"`
-		Usage *struct {
-			InputTokens              int64 `json:"input_tokens"`
-			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
-			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
-			OutputTokens             int64 `json:"output_tokens"`
-		} `json:"usage"`
-		Error *struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(raw, &ev); err != nil {
-		return nil
-	}
-
-	switch ev.Type {
-	case "message_start":
-		if ev.Message != nil {
-			a.respID = ev.Message.ID
-			if ev.Message.Model != "" {
-				a.model = ev.Message.Model
-			}
-			if ev.Message.Usage != nil {
-				u := ev.Message.Usage
-				a.usage.InputTokens = u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
-				a.usage.CacheCreationTokens = u.CacheCreationInputTokens
-				a.usage.CachedInputTokens = u.CacheReadInputTokens
-				a.usage.OutputTokens = u.OutputTokens
-			}
-		}
-	case "content_block_start":
-		var cb struct {
-			Type      string          `json:"type"`
-			ID        string          `json:"id"`
-			Name      string          `json:"name"`
-			Text      string          `json:"text"`
-			Thinking  string          `json:"thinking"`
-			Signature string          `json:"signature"`
-			Data      string          `json:"data"`
-			Input     json.RawMessage `json:"input"`
-		}
-		if json.Unmarshal(ev.ContentBlock, &cb) != nil {
-			return nil
-		}
-		blk := &blockAcc{
-			blockType:    cb.Type,
-			id:           cb.ID,
-			name:         cb.Name,
-			initialInput: strings.TrimSpace(string(cb.Input)),
-			redactedData: cb.Data,
-		}
-		if cb.Text != "" {
-			blk.textBuf.WriteString(cb.Text)
-		}
-		if cb.Thinking != "" {
-			blk.thinkingBuf.WriteString(cb.Thinking)
-		}
-		if cb.Signature != "" {
-			blk.sigBuf.WriteString(cb.Signature)
-		}
-		if cb.Type == "web_search_tool_result" || cb.Type == "web_fetch_tool_result" || cb.Type == "tool_search_tool_result" {
-			blk.rawServer = append(json.RawMessage(nil), ev.ContentBlock...)
-		}
-		a.blocks[ev.Index] = blk
-
-		if a.emit != nil {
-			switch cb.Type {
-			case "tool_use":
-				a.emit(provider.StreamChunk{Kind: provider.DeltaToolCallStart, CallID: cb.ID, ToolName: cb.Name})
-			case "server_tool_use":
-				a.emit(provider.StreamChunk{Kind: provider.DeltaHostedToolStart, CallID: cb.ID, ToolName: cb.Name})
-			case "web_search_tool_result", "web_fetch_tool_result":
-				a.emit(provider.StreamChunk{Kind: provider.DeltaHostedToolComplete, CallID: cb.ID, ToolName: cb.Type})
-			}
-		}
-	case "content_block_delta":
-		blk := a.blocks[ev.Index]
-		if blk == nil || ev.Delta == nil {
-			return nil
-		}
-		switch ev.Delta.Type {
-		case "text_delta":
-			blk.textBuf.WriteString(ev.Delta.Text)
-			if a.emit != nil && ev.Delta.Text != "" {
-				a.emit(provider.StreamChunk{Kind: provider.DeltaText, Text: ev.Delta.Text})
-			}
-		case "thinking_delta":
-			blk.thinkingBuf.WriteString(ev.Delta.Thinking)
-			if a.emit != nil && ev.Delta.Thinking != "" {
-				a.emit(provider.StreamChunk{Kind: provider.DeltaThinking, Text: ev.Delta.Thinking})
-			}
-		case "signature_delta":
-			blk.sigBuf.WriteString(ev.Delta.Signature)
-		case "input_json_delta":
-			blk.inputBuf.WriteString(ev.Delta.PartialJSON)
-			if a.emit != nil && blk.blockType == "tool_use" && ev.Delta.PartialJSON != "" {
-				a.emit(provider.StreamChunk{Kind: provider.DeltaToolCallArgs, CallID: blk.id, Arguments: ev.Delta.PartialJSON})
-			}
-		case "citations_delta":
-			if ev.Delta.Citation != nil {
-				blk.citations = append(blk.citations, schema.Citation{
-					Type:      ev.Delta.Citation.Type,
-					URL:       ev.Delta.Citation.URL,
-					Title:     ev.Delta.Citation.Title,
-					CitedText: ev.Delta.Citation.CitedText,
-				})
-			}
-		}
-	case "message_delta":
-		if ev.Delta != nil && ev.Delta.StopReason != "" {
-			a.stopReason = ev.Delta.StopReason
-		}
-		if ev.Usage != nil {
-			if ev.Usage.OutputTokens > 0 {
-				a.usage.OutputTokens = ev.Usage.OutputTokens
-			}
-			if ev.Usage.InputTokens > 0 {
-				a.usage.InputTokens = ev.Usage.InputTokens + ev.Usage.CacheCreationInputTokens + ev.Usage.CacheReadInputTokens
-			}
-			if ev.Usage.CacheReadInputTokens > 0 {
-				a.usage.CachedInputTokens = ev.Usage.CacheReadInputTokens
-			}
-			if ev.Usage.CacheCreationInputTokens > 0 {
-				a.usage.CacheCreationTokens = ev.Usage.CacheCreationInputTokens
-			}
-		}
-	case "error":
-		if ev.Error != nil {
-			return fmt.Errorf("anthropic stream error (%s): %s", ev.Error.Type, ev.Error.Message)
-		}
-		return errors.New("anthropic stream error")
-	}
-	return nil
-}
-
-func (a *anthropicStreamAcc) finish() provider.Response {
-	indices := make([]int, 0, len(a.blocks))
-	for idx := range a.blocks {
-		indices = append(indices, idx)
-	}
-	sort.Ints(indices)
-
-	var (
-		canonical []schema.ContentBlock
-		rawNative []json.RawMessage
-	)
-
-	for _, idx := range indices {
-		blk := a.blocks[idx]
-		switch blk.blockType {
-		case "thinking":
-			thinking := blk.thinkingBuf.String()
-			sig := blk.sigBuf.String()
-			nativeMap := map[string]any{
-				"type":      "thinking",
-				"thinking":  thinking,
-				"signature": sig,
-			}
-			raw, _ := json.Marshal(nativeMap)
-			rawNative = append(rawNative, raw)
-			canonical = append(canonical, schema.ContentBlock{
-				Type:      schema.BlockThinking,
-				Thinking:  thinking,
-				Signature: sig,
-			})
-		case "redacted_thinking":
-			nativeMap := map[string]any{
-				"type": "redacted_thinking",
-				"data": blk.redactedData,
-			}
-			raw, _ := json.Marshal(nativeMap)
-			rawNative = append(rawNative, raw)
-			canonical = append(canonical, schema.ContentBlock{
-				Type:         schema.BlockRedactedThinking,
-				RedactedData: blk.redactedData,
-			})
-		case "text":
-			text := blk.textBuf.String()
-			nativeMap := map[string]any{
-				"type": "text",
-				"text": text,
-			}
-			raw, _ := json.Marshal(nativeMap)
-			rawNative = append(rawNative, raw)
-			canonical = append(canonical, schema.ContentBlock{
-				Type:      schema.BlockText,
-				Text:      text,
-				Citations: blk.citations,
-			})
-		case "tool_use":
-			args := strings.TrimSpace(blk.inputBuf.String())
-			if args == "" && blk.initialInput != "" && blk.initialInput != "null" {
-				args = blk.initialInput
-			}
-			if args == "" {
-				args = "{}"
-			}
-			var inputObj any
-			if json.Unmarshal([]byte(args), &inputObj) != nil {
-				inputObj = map[string]any{}
-			}
-			nativeMap := map[string]any{
-				"type":  "tool_use",
-				"id":    blk.id,
-				"name":  blk.name,
-				"input": inputObj,
-			}
-			raw, _ := json.Marshal(nativeMap)
-			rawNative = append(rawNative, raw)
-			canonical = append(canonical, schema.ContentBlock{
-				Type:      schema.BlockToolCall,
-				CallID:    blk.id,
-				Name:      blk.name,
-				Arguments: json.RawMessage(args),
-			})
-		case "server_tool_use":
-			args := strings.TrimSpace(blk.inputBuf.String())
-			if args == "" && blk.initialInput != "" && blk.initialInput != "null" {
-				args = blk.initialInput
-			}
-			if args == "" {
-				args = "{}"
-			}
-			var inputObj any
-			if json.Unmarshal([]byte(args), &inputObj) != nil {
-				inputObj = map[string]any{}
-			}
-			nativeMap := map[string]any{
-				"type":  "server_tool_use",
-				"id":    blk.id,
-				"name":  blk.name,
-				"input": inputObj,
-			}
-			raw, _ := json.Marshal(nativeMap)
-			rawNative = append(rawNative, raw)
-			canonical = append(canonical, schema.ContentBlock{
-				Type:           schema.BlockHostedToolCall,
-				CallID:         blk.id,
-				Name:           blk.name,
-				Arguments:      json.RawMessage(args),
-				ProviderOpaque: raw,
-			})
-		case "web_search_tool_result", "web_fetch_tool_result", "tool_search_tool_result":
-			if len(blk.rawServer) > 0 {
-				rawNative = append(rawNative, blk.rawServer)
-				canonical = append(canonical, schema.ContentBlock{
-					Type:           schema.BlockHostedToolResult,
-					CallID:         blk.id,
-					Name:           blk.blockType,
-					ProviderOpaque: blk.rawServer,
-				})
-			}
-		}
-	}
-
-	a.usage.TotalTokens = a.usage.InputTokens + a.usage.OutputTokens
-	return provider.Response{
-		ID:         a.respID,
-		Model:      a.model,
-		Blocks:     canonical,
-		Usage:      a.usage,
-		StopReason: a.stopReason,
-		Native: &schema.NativeEnvelope{
-			Provider:   a.providerID,
-			WireFormat: WireFormat,
-			Model:      a.model,
-			ResponseID: a.respID,
-			RawItems:   rawNative,
-		},
-	}
-}
-
-func buildAnthropicMessages(msgs []schema.Message, wireFormat string) []anthropicMessage {
-	var out []anthropicMessage
-	appendBlocks := func(role string, blocks []map[string]any) {
-		if len(blocks) == 0 {
-			return
-		}
-		if len(out) > 0 && out[len(out)-1].Role == role {
-			out[len(out)-1].Content = append(out[len(out)-1].Content, blocks...)
-			return
-		}
-		out = append(out, anthropicMessage{Role: role, Content: blocks})
-	}
-
-	for _, m := range msgs {
-		if m.Native != nil && m.Native.WireFormat == wireFormat && len(m.Native.RawItems) > 0 {
-			var nativeBlocks []map[string]any
-			for _, raw := range m.Native.RawItems {
-				var obj map[string]any
-				if json.Unmarshal(raw, &obj) == nil && obj != nil {
-					nativeBlocks = append(nativeBlocks, obj)
-				}
-			}
-			role := "assistant"
-			if m.Role == schema.RoleUser || m.Role == schema.RoleTool {
-				role = "user"
-			}
-			appendBlocks(role, nativeBlocks)
-			continue
-		}
-
-		for _, b := range m.Blocks {
-			switch b.Type {
-			case schema.BlockCompaction:
-				if b.Text != "" {
-					appendBlocks("user", []map[string]any{{"type": "text", "text": b.Text}})
-				}
-			case schema.BlockText:
-				if b.Text == "" {
-					continue
-				}
-				role := "user"
-				if m.Role == schema.RoleAssistant {
-					role = "assistant"
-				}
-				appendBlocks(role, []map[string]any{{"type": "text", "text": b.Text}})
-			case schema.BlockImage:
-				if b.Image == nil {
-					continue
-				}
-				var src map[string]any
-				if b.Image.Base64 != "" {
-					mt := b.Image.MediaType
-					if mt == "" {
-						mt = "image/png"
-					}
-					src = map[string]any{"type": "base64", "media_type": mt, "data": b.Image.Base64}
-				} else if b.Image.URL != "" {
-					src = map[string]any{"type": "url", "url": b.Image.URL}
-				}
-				if src != nil {
-					appendBlocks("user", []map[string]any{{"type": "image", "source": src}})
-				}
-			case schema.BlockThinking:
-				// Only replay thinking blocks carrying a genuine Anthropic signature
-				// (cross-provider thinking blocks without Anthropic signature are skipped).
-				if b.Signature != "" && m.Native != nil && m.Native.WireFormat == wireFormat {
-					appendBlocks("assistant", []map[string]any{
-						{"type": "thinking", "thinking": b.Thinking, "signature": b.Signature},
-					})
-				}
-			case schema.BlockRedactedThinking:
-				if b.RedactedData != "" {
-					appendBlocks("assistant", []map[string]any{
-						{"type": "redacted_thinking", "data": b.RedactedData},
-					})
-				}
-			case schema.BlockToolCall:
-				var inputObj map[string]any
-				if json.Unmarshal(b.Arguments, &inputObj) != nil || inputObj == nil {
-					inputObj = map[string]any{}
-				}
-				appendBlocks("assistant", []map[string]any{
-					{"type": "tool_use", "id": b.CallID, "name": b.Name, "input": inputObj},
-				})
-			case schema.BlockToolResult:
-				blk := map[string]any{
-					"type":        "tool_result",
-					"tool_use_id": b.CallID,
-					"content":     b.Output,
-				}
-				if b.IsError {
-					blk["is_error"] = true
-				}
-				appendBlocks("user", []map[string]any{blk})
-			}
-		}
-	}
-	return out
-}
-
-// applyConversationCacheBreakpoints sets ephemeral cache_control on up to two
-// stable user-turn boundaries (penultimate + latest user message) in addition
-// to system prompt and last tool (totaling Anthropic's 4 cache breakpoints).
-func applyConversationCacheBreakpoints(messages []anthropicMessage) {
-	var userIndices []int
-	for i, m := range messages {
-		if m.Role == "user" && len(m.Content) > 0 {
-			userIndices = append(userIndices, i)
-		}
-	}
-	if len(userIndices) >= 2 {
-		idx := userIndices[len(userIndices)-2]
-		blocks := messages[idx].Content
-		blocks[len(blocks)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
-	}
-	if len(userIndices) >= 1 {
-		idx := userIndices[len(userIndices)-1]
-		blocks := messages[idx].Content
-		blocks[len(blocks)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
-	}
-}
-
-func buildAnthropicTools(defs []schema.ToolDef, hosted []schema.HostedTool, nativeToolSearch bool) ([]map[string]any, bool, bool) {
-	out := make([]map[string]any, 0, len(defs)+len(hosted)+1)
-	hasWebFetch := false
-	hasDeferred := false
-
-	for _, t := range defs {
-		schemaObj := map[string]any{"type": "object"}
-		if len(bytes.TrimSpace(t.InputSchema)) > 0 {
-			var parsed map[string]any
-			if json.Unmarshal(t.InputSchema, &parsed) == nil && parsed != nil {
-				if _, ok := parsed["type"]; !ok {
-					parsed["type"] = "object"
-				}
-				schemaObj = parsed
-			}
-		}
-		item := map[string]any{
-			"name":         t.Name,
-			"input_schema": schemaObj,
-		}
-		if t.Description != "" {
-			item["description"] = t.Description
-		}
-		if nativeToolSearch && t.DeferLoading && !t.AlwaysLoad {
-			item["defer_loading"] = true
-			hasDeferred = true
-		}
-		out = append(out, item)
-	}
-	if hasDeferred {
-		out = append([]map[string]any{{
-			"type": "tool_search_tool_bm25_20251119",
-			"name": "tool_search_tool_bm25",
-		}}, out...)
-	}
-
-	for _, h := range hosted {
-		switch h.Type {
-		case "web_search", "web_search_20250305":
-			obj := map[string]any{"type": "web_search_20250305", "name": "web_search"}
-			for k, v := range h.Config {
-				obj[k] = v
-			}
-			out = append(out, obj)
-		case "web_fetch", "web_fetch_20250910":
-			hasWebFetch = true
-			obj := map[string]any{"type": "web_fetch_20250910", "name": "web_fetch"}
-			for k, v := range h.Config {
-				obj[k] = v
-			}
-			out = append(out, obj)
-		default:
-			obj := map[string]any{"type": h.Type}
-			if h.Name != "" {
-				obj["name"] = h.Name
-			}
-			for k, v := range h.Config {
-				obj[k] = v
-			}
-			out = append(out, obj)
-		}
-	}
-	return out, hasWebFetch, hasDeferred
-}
-
-func buildAnthropicToolChoice(tc *schema.ToolChoice) map[string]any {
-	if tc == nil || tc.Mode == "" {
-		return nil
-	}
-	switch tc.Mode {
-	case "auto":
-		return map[string]any{"type": "auto"}
-	case "required":
-		return map[string]any{"type": "any"}
-	case "none":
-		return map[string]any{"type": "none"}
-	case "tool":
-		if tc.Name != "" {
-			return map[string]any{"type": "tool", "name": tc.Name}
-		}
-	}
-	return nil
-}
-
-func mapThinkingBudget(effort string) int {
-	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "low":
-		return 4096
-	case "medium":
-		return 10000
-	case "high":
-		return 16000
-	case "xhigh", "max":
-		return 32000
-	default:
-		return 0
-	}
 }

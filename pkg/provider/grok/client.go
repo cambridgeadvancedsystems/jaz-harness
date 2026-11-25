@@ -20,10 +20,11 @@ const (
 )
 
 type Config struct {
-	ProviderID string
-	BaseURL    string
-	APIKey     string
-	HTTPClient *http.Client
+	ProviderID   string
+	BaseURL      string
+	APIKey       string
+	ExtraHeaders map[string]string
+	HTTPClient   *http.Client
 }
 
 // Client speaks xAI's native /v1/responses API directly with native x_search
@@ -107,6 +108,9 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, emit provider
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Accept", "text/event-stream")
+		for k, v := range c.cfg.ExtraHeaders {
+			httpReq.Header.Set(k, v)
+		}
 		if c.cfg.APIKey != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 		}
@@ -144,7 +148,8 @@ func isGrokHostedCall(callID, name string) bool {
 	}
 	switch name {
 	case "x_search", "x_keyword_search", "x_semantic_search", "x_user_search", "x_thread_fetch",
-		"web_search", "web_search_with_snippets", "browse_page":
+		"web_search", "web_search_with_snippets", "browse_page",
+		"code_interpreter", "code_execution":
 		return true
 	}
 	return false

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/auth"
@@ -17,8 +18,10 @@ import (
 )
 
 const (
-	DefaultBaseURL = "https://api.openai.com/v1"
-	WireFormat     = "openai_responses"
+	DefaultBaseURL     = "https://api.openai.com/v1"
+	WireFormat         = "openai_responses"
+	turnStateHeaderKey = "x-codex-turn-state"
+	maxStickyStates    = 1024
 )
 
 type Config struct {
@@ -34,6 +37,9 @@ type Config struct {
 type Client struct {
 	cfg        Config
 	httpClient *http.Client
+
+	stateMu    sync.Mutex
+	turnStates map[string]string
 }
 
 func New(cfg Config) *Client {
@@ -59,6 +65,7 @@ func New(cfg Config) *Client {
 	return &Client{
 		cfg:        cfg,
 		httpClient: hc,
+		turnStates: make(map[string]string),
 	}
 }
 
@@ -82,7 +89,7 @@ func (c *Client) buildRequestBody(req provider.Request, stream bool) ([]byte, er
 	} else if c.isCodexOAuth() {
 		payload["instructions"] = "You are a helpful assistant."
 	}
-	if req.CacheKey != "" && !c.isCodexOAuth() {
+	if req.CacheKey != "" {
 		payload["prompt_cache_key"] = req.CacheKey
 	}
 	if req.MaxOutputTokens > 0 && !c.isCodexOAuth() {
@@ -109,9 +116,36 @@ func (c *Client) buildRequestBody(req provider.Request, stream bool) ([]byte, er
 	return json.Marshal(payload)
 }
 
-func (c *Client) applyHeaders(ctx context.Context, httpReq *http.Request, accept string, forceRefresh bool) error {
+func (c *Client) getTurnState(sessionKey string) string {
+	if sessionKey == "" {
+		return ""
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.turnStates[sessionKey]
+}
+
+func (c *Client) setTurnState(sessionKey, state string) {
+	if sessionKey == "" || state == "" {
+		return
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if len(c.turnStates) >= maxStickyStates {
+		clear(c.turnStates)
+	}
+	c.turnStates[sessionKey] = state
+}
+
+func (c *Client) applyHeaders(ctx context.Context, httpReq *http.Request, accept, sessionKey string, forceRefresh bool) error {
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", accept)
+	if sessionKey != "" {
+		httpReq.Header.Set("session_id", sessionKey)
+		if turnState := c.getTurnState(sessionKey); turnState != "" {
+			httpReq.Header.Set(turnStateHeaderKey, turnState)
+		}
+	}
 	for k, v := range c.cfg.ExtraHeaders {
 		httpReq.Header.Set(k, v)
 	}
@@ -143,14 +177,14 @@ func (c *Client) applyHeaders(ctx context.Context, httpReq *http.Request, accept
 	return nil
 }
 
-func (c *Client) doAuthenticated(ctx context.Context, endpoint string, body []byte, accept string) (*http.Response, error) {
+func (c *Client) doAuthenticated(ctx context.Context, endpoint string, body []byte, accept, sessionKey string) (*http.Response, error) {
 	refreshed := false
 	return provider.DoWithRetry(ctx, 3, func(_ int) (*http.Response, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
-		if err := c.applyHeaders(ctx, httpReq, accept, refreshed); err != nil {
+		if err := c.applyHeaders(ctx, httpReq, accept, sessionKey, refreshed); err != nil {
 			return nil, err
 		}
 		resp, err := c.httpClient.Do(httpReq)
@@ -164,7 +198,7 @@ func (c *Client) doAuthenticated(ctx context.Context, endpoint string, body []by
 			if rerr != nil {
 				return nil, rerr
 			}
-			if rerr := c.applyHeaders(ctx, retryReq, accept, true); rerr != nil {
+			if rerr := c.applyHeaders(ctx, retryReq, accept, sessionKey, true); rerr != nil {
 				return nil, rerr
 			}
 			return c.httpClient.Do(retryReq)
@@ -178,11 +212,19 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, emit provider
 	if err != nil {
 		return provider.Response{}, err
 	}
-	resp, err := c.doAuthenticated(ctx, c.cfg.BaseURL+"/responses", body, "text/event-stream")
+	sessionKey := req.ThreadID
+	if sessionKey == "" {
+		sessionKey = req.CacheKey
+	}
+	resp, err := c.doAuthenticated(ctx, c.cfg.BaseURL+"/responses", body, "text/event-stream", sessionKey)
 	if err != nil {
 		return provider.Response{}, err
 	}
 	defer resp.Body.Close()
+
+	if sticky := strings.TrimSpace(resp.Header.Get(turnStateHeaderKey)); sticky != "" {
+		c.setTurnState(sessionKey, sticky)
+	}
 
 	if resp.StatusCode >= 300 {
 		rawErr, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
@@ -212,7 +254,7 @@ func (c *Client) Compact(ctx context.Context, req provider.CompactRequest) (prov
 	if err != nil {
 		return provider.CompactResponse{}, err
 	}
-	resp, err := c.doAuthenticated(ctx, c.cfg.BaseURL+"/responses/compact", body, "application/json")
+	resp, err := c.doAuthenticated(ctx, c.cfg.BaseURL+"/responses/compact", body, "application/json", req.CacheKey)
 	if err != nil {
 		return provider.CompactResponse{}, err
 	}

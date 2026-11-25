@@ -30,23 +30,32 @@ const (
 	ModeAIStudio Mode = "ai_studio"
 )
 
+type APISurface string
+
+const (
+	SurfaceGenerateContent APISurface = "generate_content" // Vertex v1beta1 streamGenerateContent (default)
+	SurfaceInteractions    APISurface = "interactions"     // Stateless Vertex v1beta1 Interactions API (store=false)
+)
+
 type TokenSource func(ctx context.Context) (string, error)
 
 type Config struct {
-	ProviderID  string // "vertex" | "gemini"
-	Mode        Mode
-	BaseURL     string
-	APIKey      string      // AI Studio key
-	Project     string      // Vertex project
-	Location    string      // Vertex location ("global" | "us-central1" ...)
-	TokenSource TokenSource // Vertex OAuth/Workload Identity Bearer token
-	HTTPClient  *http.Client
+	ProviderID   string // "vertex" | "gemini"
+	Mode         Mode
+	Surface      APISurface
+	BaseURL      string
+	APIKey       string      // AI Studio key or relay Bearer token when RelayMode=true
+	Project      string      // Vertex project
+	Location     string      // Vertex location ("global" | "us-central1" ...)
+	TokenSource  TokenSource // Vertex OAuth / Workload Identity Bearer token
+	RelayMode    bool        // Route through a native LLM relay using Bearer auth without requiring Project
+	ExtraHeaders map[string]string
+	HTTPClient   *http.Client
 }
 
-// Client speaks Google Gemini's native generateContent / streamGenerateContent
-// wire format directly, preserving thought parts and cryptographic
-// thoughtSignature fields verbatim across turns and restarts, plus native
-// googleSearch, urlContext, and explicit cachedContent.
+// Client speaks Google Gemini's native Vertex v1beta1 API (streamGenerateContent
+// with toolConfig.includeServerSideToolInvocations, or stateless Interactions API
+// with store=false), preserving thought parts and thoughtSignature verbatim.
 type Client struct {
 	cfg        Config
 	httpClient *http.Client
@@ -54,11 +63,14 @@ type Client struct {
 
 func New(cfg Config) *Client {
 	if cfg.Mode == "" {
-		if cfg.APIKey != "" && cfg.Project == "" {
+		if cfg.APIKey != "" && cfg.Project == "" && !cfg.RelayMode {
 			cfg.Mode = ModeAIStudio
 		} else {
 			cfg.Mode = ModeVertex
 		}
+	}
+	if cfg.Surface == "" {
+		cfg.Surface = SurfaceGenerateContent
 	}
 	if cfg.ProviderID == "" {
 		if cfg.Mode == ModeVertex {
@@ -93,12 +105,18 @@ func New(cfg Config) *Client {
 	}
 }
 
-func (c *Client) ID() string         { return c.cfg.ProviderID }
-func (c *Client) WireFormat() string { return WireFormat }
+func (c *Client) ID() string { return c.cfg.ProviderID }
 
-type geminiContent struct {
-	Role  string           `json:"role"`
-	Parts []map[string]any `json:"parts"`
+func (c *Client) WireFormat() string {
+	if c.cfg.Surface == SurfaceInteractions {
+		return WireFormatInteractions
+	}
+	return WireFormat
+}
+
+func stripLegacyOpenAPISuffix(raw string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	return strings.TrimSuffix(trimmed, "/endpoints/openapi")
 }
 
 func (c *Client) buildRequestBody(req provider.Request) ([]byte, error) {
@@ -106,6 +124,7 @@ func (c *Client) buildRequestBody(req provider.Request) ([]byte, error) {
 		return nil, errors.New("gemini: model is required")
 	}
 
+	gem4 := isGemini4Model(req.Model)
 	contents := buildGeminiContents(req.Messages, WireFormat)
 	payload := map[string]any{
 		"contents": contents,
@@ -115,7 +134,9 @@ func (c *Client) buildRequestBody(req provider.Request) ([]byte, error) {
 			"parts": []map[string]any{{"text": req.SystemPrompt}},
 		}
 	}
-	if strings.TrimSpace(req.CachedContentName) != "" {
+	// Explicit cachedContent is supported on Gemini 2.5/3 regional only;
+	// Gemini 4 uses implicit/durable prefix caching and rejects explicit handles.
+	if !gem4 && strings.TrimSpace(req.CachedContentName) != "" {
 		payload["cachedContent"] = strings.TrimSpace(req.CachedContentName)
 	}
 
@@ -123,35 +144,46 @@ func (c *Client) buildRequestBody(req provider.Request) ([]byte, error) {
 	if req.MaxOutputTokens > 0 {
 		genCfg["maxOutputTokens"] = req.MaxOutputTokens
 	}
-	if req.Temperature != nil {
-		genCfg["temperature"] = *req.Temperature
-	}
-	if req.TopP != nil {
-		genCfg["topP"] = *req.TopP
+	// Gemini 4 recommends omitting temperature and topP for thinking models.
+	if !gem4 {
+		if req.Temperature != nil {
+			genCfg["temperature"] = *req.Temperature
+		}
+		if req.TopP != nil {
+			genCfg["topP"] = *req.TopP
+		}
 	}
 	thinkingCfg := map[string]any{"includeThoughts": true}
-	if level := mapGeminiThinkingLevel(req.ReasoningEffort); level != "" {
+	if level := mapGeminiThinkingLevel(req.Model, req.ReasoningEffort); level != "" {
 		thinkingCfg["thinkingLevel"] = level
 	}
 	genCfg["thinkingConfig"] = thinkingCfg
 	payload["generationConfig"] = genCfg
 
-	if tools := buildGeminiTools(req.Tools, req.HostedTools); len(tools) > 0 {
+	tools, hasFunctions, hasHosted := buildGeminiTools(req.Tools, req.HostedTools)
+	if len(tools) > 0 {
 		payload["tools"] = tools
 	}
-	if tc := buildGeminiToolConfig(req.ToolChoice); tc != nil {
+	if tc := buildGeminiToolConfig(req.ToolChoice, hasFunctions && hasHosted); tc != nil {
 		payload["toolConfig"] = tc
+	}
+	if tok := strings.TrimSpace(req.Metadata["continuation_token"]); tok != "" {
+		payload["continuationToken"] = tok
 	}
 	return json.Marshal(payload)
 }
 
 func (c *Client) endpointForModel(model string) (string, error) {
 	cleanModel := strings.TrimPrefix(strings.TrimSpace(model), "google/")
-	if c.cfg.Mode == ModeAIStudio {
-		return fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", c.cfg.BaseURL, url.PathEscape(cleanModel)), nil
+	base := stripLegacyOpenAPISuffix(c.cfg.BaseURL)
+	if c.cfg.RelayMode {
+		return fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", base, url.PathEscape(cleanModel)), nil
 	}
-	if strings.Contains(c.cfg.BaseURL, "/publishers/google") {
-		return fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", c.cfg.BaseURL, url.PathEscape(cleanModel)), nil
+	if c.cfg.Mode == ModeAIStudio {
+		return fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", base, url.PathEscape(cleanModel)), nil
+	}
+	if strings.Contains(base, "/publishers/google") {
+		return fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", base, url.PathEscape(cleanModel)), nil
 	}
 	if c.cfg.Project == "" {
 		return "", errors.New("vertex gemini: Project is required")
@@ -161,36 +193,41 @@ func (c *Client) endpointForModel(model string) (string, error) {
 		loc = "global"
 	}
 	return fmt.Sprintf(
-		"%s/v1/projects/%s/locations/%s/publishers/google/models/%s:streamGenerateContent?alt=sse",
-		c.cfg.BaseURL,
+		"%s/v1beta1/projects/%s/locations/%s/publishers/google/models/%s:streamGenerateContent?alt=sse",
+		base,
 		url.PathEscape(c.cfg.Project),
 		url.PathEscape(loc),
 		url.PathEscape(cleanModel),
 	), nil
 }
 
-func (c *Client) Stream(ctx context.Context, req provider.Request, emit provider.StreamCallback) (provider.Response, error) {
-	body, err := c.buildRequestBody(req)
-	if err != nil {
-		return provider.Response{}, err
-	}
-	endpoint, err := c.endpointForModel(req.Model)
-	if err != nil {
-		return provider.Response{}, err
-	}
-
-	resp, err := provider.DoWithRetry(ctx, 3, func(_ int) (*http.Response, error) {
+func (c *Client) doHTTP(ctx context.Context, endpoint string, body []byte) (*http.Response, error) {
+	return provider.DoWithRetry(ctx, 3, func(_ int) (*http.Response, error) {
 		httpReq, rerr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if rerr != nil {
 			return nil, rerr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Accept", "text/event-stream")
-		if c.cfg.Mode == ModeAIStudio {
+		for k, v := range c.cfg.ExtraHeaders {
+			httpReq.Header.Set(k, v)
+		}
+		switch {
+		case c.cfg.RelayMode:
+			if c.cfg.APIKey != "" {
+				httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+			} else if c.cfg.TokenSource != nil {
+				tok, terr := c.cfg.TokenSource(ctx)
+				if terr != nil {
+					return nil, terr
+				}
+				httpReq.Header.Set("Authorization", "Bearer "+tok)
+			}
+		case c.cfg.Mode == ModeAIStudio:
 			if c.cfg.APIKey != "" {
 				httpReq.Header.Set("x-goog-api-key", c.cfg.APIKey)
 			}
-		} else {
+		default:
 			if c.cfg.TokenSource == nil {
 				return nil, errors.New("vertex gemini: TokenSource not configured")
 			}
@@ -202,6 +239,22 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, emit provider
 		}
 		return c.httpClient.Do(httpReq)
 	})
+}
+
+func (c *Client) Stream(ctx context.Context, req provider.Request, emit provider.StreamCallback) (provider.Response, error) {
+	if c.cfg.Surface == SurfaceInteractions {
+		return c.streamInteractions(ctx, req, emit)
+	}
+	body, err := c.buildRequestBody(req)
+	if err != nil {
+		return provider.Response{}, err
+	}
+	endpoint, err := c.endpointForModel(req.Model)
+	if err != nil {
+		return provider.Response{}, err
+	}
+
+	resp, err := c.doHTTP(ctx, endpoint, body)
 	if err != nil {
 		return provider.Response{}, err
 	}
@@ -225,15 +278,18 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 
 	var (
-		model       = fallbackModel
-		stopReason  = "STOP"
-		usage       schema.Usage
-		nativeParts []json.RawMessage
-		canonical   []schema.ContentBlock
-		textBuf     strings.Builder
-		thoughtBuf  strings.Builder
-		citations   []schema.Citation
-		seenCits    = map[string]bool{}
+		model             = fallbackModel
+		stopReason        = "STOP"
+		continuationToken string
+		usage             schema.Usage
+		nativeParts       []json.RawMessage
+		canonical         []schema.ContentBlock
+		textBuf           strings.Builder
+		textSig           string
+		thoughtBuf        strings.Builder
+		thoughtSig        string
+		citations         []schema.Citation
+		seenCits          = map[string]bool{}
 	)
 
 	flushText := func() {
@@ -241,11 +297,13 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 			return
 		}
 		canonical = append(canonical, schema.ContentBlock{
-			Type:      schema.BlockText,
-			Text:      textBuf.String(),
-			Citations: citations,
+			Type:            schema.BlockText,
+			Text:            textBuf.String(),
+			Citations:       citations,
+			ThoughtSignBlob: textSig,
 		})
 		textBuf.Reset()
+		textSig = ""
 		citations = nil
 	}
 	flushThought := func() {
@@ -253,10 +311,12 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 			return
 		}
 		canonical = append(canonical, schema.ContentBlock{
-			Type:     schema.BlockThinking,
-			Thinking: thoughtBuf.String(),
+			Type:            schema.BlockThinking,
+			Thinking:        thoughtBuf.String(),
+			ThoughtSignBlob: thoughtSig,
 		})
 		thoughtBuf.Reset()
+		thoughtSig = ""
 	}
 
 	for sc.Scan() {
@@ -269,24 +329,32 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 			continue
 		}
 		var chunk struct {
-			ModelVersion string `json:"modelVersion"`
-			Candidates   []struct {
+			ModelVersion      string `json:"modelVersion"`
+			ContinuationToken string `json:"continuationToken"`
+			Candidates        []struct {
 				Content *struct {
 					Role  string            `json:"role"`
 					Parts []json.RawMessage `json:"parts"`
 				} `json:"content"`
 				FinishReason      string `json:"finishReason"`
 				GroundingMetadata *struct {
-					GroundingChunks []struct {
+					WebSearchQueries []string `json:"webSearchQueries"`
+					GroundingChunks  []struct {
 						Web *struct {
 							URI   string `json:"uri"`
 							Title string `json:"title"`
 						} `json:"web"`
 					} `json:"groundingChunks"`
 				} `json:"groundingMetadata"`
+				URLContextMetadata *struct {
+					URLMetadata []struct {
+						RetrievedURL string `json:"retrievedUrl"`
+					} `json:"urlMetadata"`
+				} `json:"urlContextMetadata"`
 			} `json:"candidates"`
 			UsageMetadata *struct {
 				PromptTokenCount        int64 `json:"promptTokenCount"`
+				ToolUsePromptTokenCount int64 `json:"toolUsePromptTokenCount"`
 				CachedContentTokenCount int64 `json:"cachedContentTokenCount"`
 				CandidatesTokenCount    int64 `json:"candidatesTokenCount"`
 				ThoughtsTokenCount      int64 `json:"thoughtsTokenCount"`
@@ -299,15 +367,18 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 		if chunk.ModelVersion != "" {
 			model = chunk.ModelVersion
 		}
+		if chunk.ContinuationToken != "" {
+			continuationToken = chunk.ContinuationToken
+		}
 		if chunk.UsageMetadata != nil {
 			u := chunk.UsageMetadata
-			usage.InputTokens = u.PromptTokenCount
+			usage.InputTokens = u.PromptTokenCount + u.ToolUsePromptTokenCount
 			usage.CachedInputTokens = u.CachedContentTokenCount
 			usage.OutputTokens = u.CandidatesTokenCount
 			usage.ReasoningTokens = u.ThoughtsTokenCount
 			usage.TotalTokens = u.TotalTokenCount
 			if usage.TotalTokens == 0 {
-				usage.TotalTokens = u.PromptTokenCount + u.CandidatesTokenCount + u.ThoughtsTokenCount
+				usage.TotalTokens = usage.InputTokens + u.CandidatesTokenCount + u.ThoughtsTokenCount
 			}
 		}
 
@@ -323,6 +394,17 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 							Type:  "url_citation",
 							URL:   gc.Web.URI,
 							Title: gc.Web.Title,
+						})
+					}
+				}
+			}
+			if cand.URLContextMetadata != nil {
+				for _, um := range cand.URLContextMetadata.URLMetadata {
+					if um.RetrievedURL != "" && !seenCits[um.RetrievedURL] {
+						seenCits[um.RetrievedURL] = true
+						citations = append(citations, schema.Citation{
+							Type: "url_citation",
+							URL:  um.RetrievedURL,
 						})
 					}
 				}
@@ -343,23 +425,68 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 						Name string          `json:"name"`
 						Args json.RawMessage `json:"args"`
 					} `json:"functionCall"`
+					ToolCall *struct {
+						ID       string `json:"id"`
+						ToolType string `json:"toolType"`
+					} `json:"toolCall"`
+					ToolResponse *struct {
+						ID       string `json:"id"`
+						ToolType string `json:"toolType"`
+					} `json:"toolResponse"`
 				}
 				if json.Unmarshal(cp, &part) != nil {
 					continue
 				}
 
-				if part.Thought && part.Text != "" {
-					thoughtBuf.WriteString(part.Text)
-					if emit != nil {
-						emit(provider.StreamChunk{Kind: provider.DeltaThinking, Text: part.Text})
+				if part.Thought {
+					if part.ThoughtSignature != "" {
+						thoughtSig = part.ThoughtSignature
+					}
+					if part.Text != "" {
+						thoughtBuf.WriteString(part.Text)
+						if emit != nil {
+							emit(provider.StreamChunk{Kind: provider.DeltaThinking, Text: part.Text})
+						}
 					}
 					continue
 				}
-				if part.Text != "" {
+				if part.ToolCall != nil {
 					flushThought()
-					textBuf.WriteString(part.Text)
+					flushText()
 					if emit != nil {
-						emit(provider.StreamChunk{Kind: provider.DeltaText, Text: part.Text})
+						emit(provider.StreamChunk{Kind: provider.DeltaHostedToolStart, CallID: part.ToolCall.ID, ToolName: part.ToolCall.ToolType})
+					}
+					canonical = append(canonical, schema.ContentBlock{
+						Type:            schema.BlockHostedToolCall,
+						CallID:          part.ToolCall.ID,
+						Name:            part.ToolCall.ToolType,
+						ThoughtSignBlob: part.ThoughtSignature,
+						ProviderOpaque:  cp,
+					})
+					continue
+				}
+				if part.ToolResponse != nil {
+					if emit != nil {
+						emit(provider.StreamChunk{Kind: provider.DeltaHostedToolComplete, CallID: part.ToolResponse.ID, ToolName: part.ToolResponse.ToolType})
+					}
+					canonical = append(canonical, schema.ContentBlock{
+						Type:           schema.BlockHostedToolResult,
+						CallID:         part.ToolResponse.ID,
+						Name:           part.ToolResponse.ToolType,
+						ProviderOpaque: cp,
+					})
+					continue
+				}
+				if part.Text != "" || (part.FunctionCall == nil && part.ThoughtSignature != "") {
+					flushThought()
+					if part.ThoughtSignature != "" {
+						textSig = part.ThoughtSignature
+					}
+					if part.Text != "" {
+						textBuf.WriteString(part.Text)
+						if emit != nil {
+							emit(provider.StreamChunk{Kind: provider.DeltaText, Text: part.Text})
+						}
 					}
 				}
 				if part.FunctionCall != nil {
@@ -369,10 +496,7 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 					if callID == "" {
 						callID = "gcall_" + uuid.NewString()[:8]
 					}
-					args := part.FunctionCall.Args
-					if len(bytes.TrimSpace(args)) == 0 {
-						args = json.RawMessage(`{}`)
-					}
+					args := json.RawMessage(provider.SanitizeToolArgsJSON(part.FunctionCall.Args))
 					if emit != nil {
 						emit(provider.StreamChunk{
 							Kind:      provider.DeltaToolCallStart,
@@ -398,18 +522,17 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 	flushThought()
 	flushText()
 
-	// Wrap native model content object verbatim so replay preserves every
-	// thoughtSignature and thought part byte-for-byte.
 	modelContentObj, _ := json.Marshal(map[string]any{
 		"role":  "model",
 		"parts": nativeParts,
 	})
 	return provider.Response{
-		ID:         "gem_" + uuid.NewString()[:12],
-		Model:      model,
-		Blocks:     canonical,
-		Usage:      usage,
-		StopReason: stopReason,
+		ID:                "gem_" + uuid.NewString()[:12],
+		Model:             model,
+		Blocks:            canonical,
+		Usage:             usage,
+		StopReason:        stopReason,
+		ContinuationToken: continuationToken,
 		Native: &schema.NativeEnvelope{
 			Provider:   providerID,
 			WireFormat: WireFormat,
@@ -417,187 +540,4 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 			RawItems:   []json.RawMessage{modelContentObj},
 		},
 	}, nil
-}
-
-func buildGeminiContents(msgs []schema.Message, wireFormat string) []any {
-	out := make([]any, 0, len(msgs))
-	callNames := make(map[string]string)
-
-	for _, m := range msgs {
-		for _, b := range m.Blocks {
-			if b.Type == schema.BlockToolCall && b.CallID != "" && b.Name != "" {
-				callNames[b.CallID] = b.Name
-			}
-		}
-		if m.Native != nil && m.Native.WireFormat == wireFormat && len(m.Native.RawItems) > 0 {
-			for _, raw := range m.Native.RawItems {
-				out = append(out, raw)
-			}
-			continue
-		}
-
-		role := "user"
-		if m.Role == schema.RoleAssistant {
-			role = "model"
-		}
-		var parts []map[string]any
-		for _, b := range m.Blocks {
-			switch b.Type {
-			case schema.BlockCompaction:
-				if b.Text != "" {
-					parts = append(parts, map[string]any{"text": b.Text})
-				}
-			case schema.BlockText:
-				if b.Text != "" {
-					parts = append(parts, map[string]any{"text": b.Text})
-				}
-			case schema.BlockImage:
-				if b.Image != nil && b.Image.Base64 != "" {
-					mt := b.Image.MediaType
-					if mt == "" {
-						mt = "image/png"
-					}
-					parts = append(parts, map[string]any{
-						"inlineData": map[string]any{
-							"mimeType": mt,
-							"data":     b.Image.Base64,
-						},
-					})
-				}
-			case schema.BlockToolCall:
-				var argsObj map[string]any
-				if json.Unmarshal(b.Arguments, &argsObj) != nil || argsObj == nil {
-					argsObj = map[string]any{}
-				}
-				fc := map[string]any{
-					"name": b.Name,
-					"args": argsObj,
-				}
-				if b.CallID != "" {
-					fc["id"] = b.CallID
-				}
-				part := map[string]any{"functionCall": fc}
-				if b.ThoughtSignBlob != "" {
-					part["thoughtSignature"] = b.ThoughtSignBlob
-				}
-				parts = append(parts, part)
-			case schema.BlockToolResult:
-				name := b.Name
-				if name == "" {
-					name = callNames[b.CallID]
-				}
-				if name == "" {
-					name = "tool"
-				}
-				fr := map[string]any{
-					"name":     name,
-					"response": map[string]any{"result": b.Output, "is_error": b.IsError},
-				}
-				if b.CallID != "" {
-					fr["id"] = b.CallID
-				}
-				parts = append(parts, map[string]any{"functionResponse": fr})
-			}
-		}
-		if len(parts) > 0 {
-			out = append(out, geminiContent{Role: role, Parts: parts})
-		}
-	}
-	return out
-}
-
-func buildGeminiTools(defs []schema.ToolDef, hosted []schema.HostedTool) []map[string]any {
-	var tools []map[string]any
-	if len(defs) > 0 {
-		decls := make([]map[string]any, 0, len(defs))
-		for _, t := range defs {
-			decl := map[string]any{
-				"name": t.Name,
-			}
-			if t.Description != "" {
-				decl["description"] = t.Description
-			}
-			if len(bytes.TrimSpace(t.InputSchema)) > 0 {
-				var obj map[string]any
-				if json.Unmarshal(t.InputSchema, &obj) == nil && obj != nil {
-					cleanGeminiSchema(obj)
-					decl["parameters"] = obj
-				}
-			}
-			decls = append(decls, decl)
-		}
-		tools = append(tools, map[string]any{"functionDeclarations": decls})
-	}
-	for _, h := range hosted {
-		switch h.Type {
-		case "google_search", "web_search":
-			tools = append(tools, map[string]any{"googleSearch": map[string]any{}})
-		case "url_context", "web_fetch":
-			tools = append(tools, map[string]any{"urlContext": map[string]any{}})
-		default:
-			cfg := h.Config
-			if cfg == nil {
-				cfg = map[string]any{}
-			}
-			tools = append(tools, map[string]any{h.Type: cfg})
-		}
-	}
-	return tools
-}
-
-func cleanGeminiSchema(obj map[string]any) {
-	delete(obj, "additionalProperties")
-	delete(obj, "$schema")
-	if props, ok := obj["properties"].(map[string]any); ok {
-		for _, v := range props {
-			if child, ok := v.(map[string]any); ok {
-				cleanGeminiSchema(child)
-			}
-		}
-	}
-	if items, ok := obj["items"].(map[string]any); ok {
-		cleanGeminiSchema(items)
-	}
-}
-
-func buildGeminiToolConfig(tc *schema.ToolChoice) map[string]any {
-	if tc == nil || tc.Mode == "" {
-		return nil
-	}
-	cfg := map[string]any{}
-	switch tc.Mode {
-	case "auto":
-		cfg["mode"] = "AUTO"
-	case "required":
-		cfg["mode"] = "ANY"
-	case "none":
-		cfg["mode"] = "NONE"
-	case "tool":
-		cfg["mode"] = "ANY"
-		if tc.Name != "" {
-			cfg["allowedFunctionNames"] = []string{tc.Name}
-		}
-	default:
-		return nil
-	}
-	return map[string]any{"functionCallingConfig": cfg}
-}
-
-func mapGeminiThinkingLevel(effort string) string {
-	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "none":
-		return "MINIMAL"
-	case "minimal":
-		return "MINIMAL"
-	case "low":
-		return "LOW"
-	case "medium":
-		return "MEDIUM"
-	case "high":
-		return "HIGH"
-	case "xhigh", "max":
-		return "HIGH"
-	default:
-		return ""
-	}
 }

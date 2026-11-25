@@ -21,7 +21,7 @@ type Config struct {
 }
 
 // Server exposes Jaz Harness over HTTP + SSE with monotonic `?after_seq=` event
-// replay so Desktop, Web, iOS, CLI, or jaz-control can drive it remotely.
+// replay so Desktop, Web, iOS, CLI, or remote control planes can drive it remotely.
 type Server struct {
 	cfg    Config
 	engine *harness.Engine

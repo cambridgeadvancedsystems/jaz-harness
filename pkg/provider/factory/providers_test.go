@@ -18,6 +18,7 @@ import (
 	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/auth"
 	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/provider"
 	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/provider/factory"
+	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/provider/gemini"
 	"github.com/cambridgeadvancedsystems/jaz-harness/pkg/schema"
 )
 
@@ -43,6 +44,8 @@ func TestOpenAIAndCodexOAuthNativeWireAndCompaction(t *testing.T) {
 	var sawCacheKey bool
 	var sawCompact bool
 	var sawEncryptedReplay bool
+	var sawStickyTurnState bool
+	var sawSessionID bool
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -57,12 +60,19 @@ func TestOpenAIAndCodexOAuthNativeWireAndCompaction(t *testing.T) {
 			})
 			return
 		}
+		if r.Header.Get("session_id") == "thr_1" {
+			sawSessionID = true
+		}
+		if r.Header.Get("x-codex-turn-state") == "sticky_state_xyz" {
+			sawStickyTurnState = true
+		}
 		if strings.Contains(string(body), `"prompt_cache_key":"thr_1"`) {
 			sawCacheKey = true
 		}
 		if strings.Contains(string(body), `"encrypted_content":"enc_rs_1"`) {
 			sawEncryptedReplay = true
 		}
+		w.Header().Set("x-codex-turn-state", "sticky_state_xyz")
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4\"}}\n\n")
 		fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"enc_rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"checked\"}]}}\n\n")
@@ -92,11 +102,11 @@ func TestOpenAIAndCodexOAuthNativeWireAndCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sawCacheKey || resp1.Usage.CachedInputTokens != 80 {
-		t.Fatalf("expected cache key and 80 cached tokens, got %+v", resp1.Usage)
+	if !sawCacheKey || !sawSessionID || resp1.Usage.CachedInputTokens != 80 {
+		t.Fatalf("expected cache key, session_id, and 80 cached tokens, got %+v", resp1.Usage)
 	}
 
-	// Second turn must replay encrypted reasoning verbatim via NativeEnvelope.
+	// Second turn must replay encrypted reasoning verbatim AND echo x-codex-turn-state.
 	_, err = p.Stream(context.Background(), provider.Request{
 		ThreadID: "thr_1",
 		Model:    "gpt-5.4",
@@ -110,8 +120,8 @@ func TestOpenAIAndCodexOAuthNativeWireAndCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sawEncryptedReplay {
-		t.Fatal("expected encrypted_content reasoning item to replay verbatim")
+	if !sawEncryptedReplay || !sawStickyTurnState {
+		t.Fatalf("expected encrypted_content replay (%v) and x-codex-turn-state sticky header (%v)", sawEncryptedReplay, sawStickyTurnState)
 	}
 
 	rc, ok := p.(provider.RemoteCompactor)
@@ -217,7 +227,7 @@ func TestAnthropicDirectThinkingSignaturesCacheAndNativeDeferredTools(t *testing
 	p, err := factory.New(factory.ProfileConfig{
 		Provider:   "anthropic",
 		BaseURL:    srv.URL,
-		APIKey:     "sk-ant-test",
+		APIKey:     "test-anthropic-key",
 		HTTPClient: srv.Client(),
 	})
 	if err != nil {
@@ -272,6 +282,53 @@ func TestAnthropicDirectThinkingSignaturesCacheAndNativeDeferredTools(t *testing
 	if res2.Usage.CachedInputTokens != 500 {
 		t.Fatalf("expected 500 cached tokens, got %+v", res2.Usage)
 	}
+	if got := strings.Count(secondReqBody, `"cache_control":{"type":"ephemeral"}`); got > 4 {
+		t.Fatalf("anthropic cache_control breakpoints must never exceed 4, got %d", got)
+	}
+}
+
+func TestAnthropicRelayBearerAndNoRetryHeader(t *testing.T) {
+	var attempts atomic.Int32
+	var sawBearer string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		sawBearer = r.Header.Get("Authorization")
+		if r.Header.Get("x-api-key") != "" {
+			t.Errorf("relay bearer mode must not send x-api-key")
+		}
+		w.Header().Set("x-should-retry", "false")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"error":{"type":"rate_limit_error","message":"stop retrying"}}`)
+	}))
+	defer srv.Close()
+
+	p, err := factory.New(factory.ProfileConfig{
+		Provider:   "anthropic",
+		BaseURL:    srv.URL,
+		APIKey:     "turn_llm_tok_1",
+		RelayMode:  true,
+		HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.Stream(context.Background(), provider.Request{
+		Model: "claude-sonnet-4-5",
+		Messages: []schema.Message{
+			{Role: schema.RoleAssistant, Blocks: []schema.ContentBlock{{Type: schema.BlockToolCall, CallID: "t1", Name: "fn", Arguments: json.RawMessage(`{malformed`)}}},
+			{Role: schema.RoleUser, Blocks: []schema.ContentBlock{{Type: schema.BlockText, Text: "hi"}}},
+		},
+	}, nil)
+	if err == nil {
+		t.Fatal("expected 429 error")
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("x-should-retry: false must prevent retries, got %d attempts", attempts.Load())
+	}
+	if sawBearer != "Bearer turn_llm_tok_1" {
+		t.Fatalf("expected relay Bearer auth, got %q", sawBearer)
+	}
 }
 
 func TestAnthropicBedrockAndVertexModes(t *testing.T) {
@@ -291,7 +348,7 @@ func TestAnthropicBedrockAndVertexModes(t *testing.T) {
 	bp, err := factory.New(factory.ProfileConfig{
 		Provider:   "bedrock_anthropic",
 		BaseURL:    bedrockSrv.URL,
-		AWS:        auth.AWSCredentials{AccessKeyID: "AKIA", SecretAccessKey: "SEC", Region: "us-east-1"},
+		AWS:        auth.AWSCredentials{AccessKeyID: "TESTKEYID", SecretAccessKey: "TESTSECRET", Region: "us-east-1"},
 		HTTPClient: bedrockSrv.Client(),
 	})
 	if err != nil {
@@ -384,26 +441,36 @@ func TestGrokNativeXSearchAndConvID(t *testing.T) {
 	}
 }
 
-func TestGeminiNativeThoughtSignatureGoogleSearchAndCachedContent(t *testing.T) {
+func TestGemini4VertexV1Beta1CombinedToolsSignaturesAndRelay(t *testing.T) {
 	var reqNum atomic.Int32
+	var firstPath string
+	var firstBody string
 	var secondBody string
+	var thirdBody string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		n := reqNum.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
-		if n == 1 {
-			fmt.Fprint(w, "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"thought\":true,\"text\":\"Thinking step\",\"thoughtSignature\":\"GEM_SIG_999\"},{\"functionCall\":{\"id\":\"fc_1\",\"name\":\"lookup\",\"args\":{\"q\":\"price\"}},\"thoughtSignature\":\"GEM_SIG_FC_1\"}]}}],\"usageMetadata\":{\"promptTokenCount\":200,\"cachedContentTokenCount\":150,\"candidatesTokenCount\":30}}\n\n")
-			return
+		switch n {
+		case 1:
+			firstPath = r.URL.Path
+			firstBody = string(body)
+			fmt.Fprint(w, "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"thought\":true,\"text\":\"Thinking step\",\"thoughtSignature\":\"GEM_SIG_999\"},{\"functionCall\":{\"id\":\"fc_1\",\"name\":\"lookup\",\"args\":{\"q\":\"price\"}},\"thoughtSignature\":\"GEM_SIG_FC_1\"}]}}],\"usageMetadata\":{\"promptTokenCount\":200,\"toolUsePromptTokenCount\":40,\"cachedContentTokenCount\":150,\"candidatesTokenCount\":30}}\n\n")
+		case 2:
+			secondBody = string(body)
+			fmt.Fprint(w, "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"$42\",\"thoughtSignature\":\"GEM_SIG_TXT\"}]},\"finishReason\":\"STOP\",\"groundingMetadata\":{\"groundingChunks\":[{\"web\":{\"uri\":\"https://docs.example.com\",\"title\":\"Pricing\"}}]},\"urlContextMetadata\":{\"urlMetadata\":[{\"retrievedUrl\":\"https://status.example.com\",\"urlRetrievalStatus\":\"URL_RETRIEVAL_STATUS_SUCCESS\"}]}}],\"usageMetadata\":{\"promptTokenCount\":260,\"cachedContentTokenCount\":200,\"candidatesTokenCount\":10}}\n\n")
+		default:
+			thirdBody = string(body)
+			fmt.Fprint(w, "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"done\"}]}}]}\n\n")
 		}
-		secondBody = string(body)
-		fmt.Fprint(w, "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"$42\"}]},\"finishReason\":\"STOP\",\"groundingMetadata\":{\"groundingChunks\":[{\"web\":{\"uri\":\"https://docs.example.com\",\"title\":\"Pricing\"}}]}}],\"usageMetadata\":{\"promptTokenCount\":260,\"cachedContentTokenCount\":200,\"candidatesTokenCount\":10}}\n\n")
 	}))
 	defer srv.Close()
 
+	// Strip legacy /endpoints/openapi suffix automatically and route to Vertex v1beta1.
 	p, err := factory.New(factory.ProfileConfig{
 		Provider:       "vertex",
-		BaseURL:        srv.URL,
+		BaseURL:        srv.URL + "/endpoints/openapi",
 		VertexProject:  "proj-1",
 		VertexLocation: "global",
 		GCPTokenSource: func(_ context.Context) (string, error) { return "gcp-tok", nil },
@@ -412,9 +479,13 @@ func TestGeminiNativeThoughtSignatureGoogleSearchAndCachedContent(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	temp := 0.7
+	topP := 0.9
 	res1, err := p.Stream(context.Background(), provider.Request{
 		Model:             "google/gemini-4-neon",
-		ReasoningEffort:   "high",
+		ReasoningEffort:   "xhigh",
+		Temperature:       &temp,
+		TopP:              &topP,
 		CachedContentName: "projects/proj-1/locations/global/cachedContents/cc_1",
 		HostedTools:       []schema.HostedTool{{Type: "google_search"}, {Type: "url_context"}},
 		Tools:             []schema.ToolDef{{Name: "lookup", Description: "Lookup"}},
@@ -423,11 +494,34 @@ func TestGeminiNativeThoughtSignatureGoogleSearchAndCachedContent(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !strings.HasPrefix(firstPath, "/v1beta1/projects/proj-1/locations/global/publishers/google/models/gemini-4-neon:streamGenerateContent") {
+		t.Fatalf("expected Vertex v1beta1 path without /endpoints/openapi, got %q", firstPath)
+	}
+	for _, want := range []string{
+		`"thinkingLevel":"XHIGH"`,
+		`"includeServerSideToolInvocations":true`,
+		`"googleSearch":{}`,
+		`"urlContext":{}`,
+		`"functionDeclarations"`,
+	} {
+		if !strings.Contains(firstBody, want) {
+			t.Fatalf("first Gemini 4 request missing %s\nbody=%s", want, firstBody)
+		}
+	}
+	for _, forbid := range []string{`"temperature"`, `"topP"`, `"cachedContent"`} {
+		if strings.Contains(firstBody, forbid) {
+			t.Fatalf("Gemini 4 request must omit %s\nbody=%s", forbid, firstBody)
+		}
+	}
+	if res1.Usage.InputTokens != 240 {
+		t.Fatalf("expected promptTokenCount(200)+toolUsePromptTokenCount(40)=240, got %+v", res1.Usage)
+	}
+
 	res2, err := p.Stream(context.Background(), provider.Request{
-		Model:             "google/gemini-4-neon",
-		CachedContentName: "projects/proj-1/locations/global/cachedContents/cc_1",
-		HostedTools:       []schema.HostedTool{{Type: "google_search"}, {Type: "url_context"}},
-		Tools:             []schema.ToolDef{{Name: "lookup", Description: "Lookup"}},
+		Model:           "google/gemini-4-neon",
+		ReasoningEffort: "minimal", // must clamp to LOW on Gemini 4 (never MINIMAL)
+		HostedTools:     []schema.HostedTool{{Type: "google_search"}, {Type: "url_context"}},
+		Tools:           []schema.ToolDef{{Name: "lookup", Description: "Lookup"}},
 		Messages: []schema.Message{
 			{Role: schema.RoleUser, Blocks: []schema.ContentBlock{{Type: schema.BlockText, Text: "price?"}}},
 			{Role: schema.RoleAssistant, Blocks: res1.Blocks, Native: res1.Native},
@@ -438,18 +532,103 @@ func TestGeminiNativeThoughtSignatureGoogleSearchAndCachedContent(t *testing.T) 
 		t.Fatal(err)
 	}
 	for _, want := range []string{
+		`"thinkingLevel":"LOW"`,
 		`"thoughtSignature":"GEM_SIG_999"`,
 		`"thoughtSignature":"GEM_SIG_FC_1"`,
-		`"googleSearch":{}`,
-		`"urlContext":{}`,
-		`"cachedContent":"projects/proj-1/locations/global/cachedContents/cc_1"`,
 	} {
 		if !strings.Contains(secondBody, want) {
-			t.Fatalf("second Gemini request missing %s\nbody=%s", want, secondBody)
+			t.Fatalf("second Gemini 4 request missing %s\nbody=%s", want, secondBody)
 		}
 	}
-	if len(res2.Blocks) == 0 || len(res2.Blocks[0].Citations) != 1 || res2.Usage.CachedInputTokens != 200 {
-		t.Fatalf("unexpected Gemini response: blocks=%+v usage=%+v", res2.Blocks, res2.Usage)
+	if strings.Contains(secondBody, `"MINIMAL"`) {
+		t.Fatalf("Gemini 4 must never emit MINIMAL thinkingLevel: %s", secondBody)
+	}
+	if len(res2.Blocks) == 0 || len(res2.Blocks[0].Citations) != 2 || res2.Blocks[0].ThoughtSignBlob != "GEM_SIG_TXT" || res2.Usage.CachedInputTokens != 200 {
+		t.Fatalf("unexpected Gemini 4 response (grounding+urlContext+text sig): blocks=%+v usage=%+v", res2.Blocks, res2.Usage)
+	}
+
+	// Canonical projection of parallel functionCalls must attach thoughtSignature ONLY to the first functionCall,
+	// while explicit cachedContent remains allowed on Gemini 2.5.
+	_, err = p.Stream(context.Background(), provider.Request{
+		Model:             "gemini-2.5-pro",
+		CachedContentName: "projects/proj-1/locations/us-central1/cachedContents/cc_25",
+		Messages: []schema.Message{
+			{
+				Role: schema.RoleAssistant,
+				Blocks: []schema.ContentBlock{
+					{Type: schema.BlockToolCall, CallID: "c1", Name: "fn_a", Arguments: json.RawMessage(`{"a":1}`), ThoughtSignBlob: "SIG_PARALLEL"},
+					{Type: schema.BlockToolCall, CallID: "c2", Name: "fn_b", Arguments: json.RawMessage(`{"b":2}`), ThoughtSignBlob: "SIG_PARALLEL"},
+				},
+			},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(thirdBody, `"thoughtSignature":"SIG_PARALLEL"`); got != 1 {
+		t.Fatalf("parallel functionCalls must emit thoughtSignature only on first call, got %d in %s", got, thirdBody)
+	}
+	if !strings.Contains(thirdBody, `"cachedContent":"projects/proj-1/locations/us-central1/cachedContents/cc_25"`) {
+		t.Fatalf("Gemini 2.5 should preserve explicit cachedContent: %s", thirdBody)
+	}
+}
+
+func TestGeminiInteractionsStatelessAPIAndRelay(t *testing.T) {
+	var sawPath string
+	var sawAuth string
+	var reqBody string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		sawPath = r.URL.Path
+		sawAuth = r.Header.Get("Authorization")
+		reqBody = string(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"event_type\":\"content.delta\",\"delta\":{\"type\":\"thought\",\"thought\":\"Checking\"}}\n\n")
+		fmt.Fprint(w, "data: {\"event_type\":\"content.delta\",\"delta\":{\"type\":\"google_search_call\",\"id\":\"gs_1\"}}\n\n")
+		fmt.Fprint(w, "data: {\"event_type\":\"content.delta\",\"delta\":{\"type\":\"text\",\"text\":\"Part 1\"}}\n\n")
+		fmt.Fprint(w, "data: {\"event_type\":\"interaction.complete\",\"interaction\":{\"id\":\"int_1\",\"model\":\"gemini-4-neon\",\"status\":\"requires_continuation\",\"continuation_token\":\"ctok_abc\",\"outputs\":[{\"type\":\"text\",\"text\":\"Part 1\",\"signature\":\"INT_SIG_1\"}],\"usage\":{\"total_input_tokens\":100,\"total_cached_tokens\":80,\"total_output_tokens\":25,\"total_thought_tokens\":15}}}\n\n")
+	}))
+	defer srv.Close()
+
+	p, err := factory.New(factory.ProfileConfig{
+		Provider:      "vertex",
+		GeminiSurface: gemini.SurfaceInteractions,
+		BaseURL:       srv.URL,
+		APIKey:        "relay_tok_9",
+		RelayMode:     true,
+		HTTPClient:    srv.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := p.Stream(context.Background(), provider.Request{
+		Model:           "google/gemini-4-neon",
+		ReasoningEffort: "xhigh",
+		HostedTools:     []schema.HostedTool{{Type: "google_search"}, {Type: "url_context"}},
+		Tools:           []schema.ToolDef{{Name: "lookup", Description: "Lookup"}},
+		Messages:        []schema.Message{{Role: schema.RoleUser, Blocks: []schema.ContentBlock{{Type: schema.BlockText, Text: "research"}}}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sawPath != "/interactions" || sawAuth != "Bearer relay_tok_9" {
+		t.Fatalf("unexpected relay interactions path=%q auth=%q", sawPath, sawAuth)
+	}
+	for _, want := range []string{
+		`"store":false`,
+		`"stream":true`,
+		`"type":"google_search"`,
+		`"type":"url_context"`,
+		`"type":"function"`,
+		`"thinking_level":"xhigh"`,
+	} {
+		if !strings.Contains(reqBody, want) {
+			t.Fatalf("interactions request missing %s\nbody=%s", want, reqBody)
+		}
+	}
+	if res.ContinuationToken != "ctok_abc" || res.Usage.CachedInputTokens != 80 || res.Usage.ReasoningTokens != 15 {
+		t.Fatalf("unexpected interactions response: token=%q usage=%+v", res.ContinuationToken, res.Usage)
 	}
 }
 
@@ -520,7 +699,7 @@ func TestMetaAndOpenRouterAndBedrockOpenAICompat(t *testing.T) {
 	bop, err := factory.New(factory.ProfileConfig{
 		Provider:   "bedrock_openai",
 		BaseURL:    srv.URL,
-		AWS:        auth.AWSCredentials{AccessKeyID: "AKIA", SecretAccessKey: "SEC", Region: "us-west-2"},
+		AWS:        auth.AWSCredentials{AccessKeyID: "TESTKEYID", SecretAccessKey: "TESTSECRET", Region: "us-west-2"},
 		HTTPClient: srv.Client(),
 	})
 	if err != nil {

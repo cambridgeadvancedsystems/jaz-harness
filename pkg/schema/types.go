@@ -72,14 +72,14 @@ type NativeEnvelope struct {
 }
 
 type Message struct {
-	ID         string          `json:"id"`
-	Seq        int64           `json:"seq"`
-	TurnEpoch  int64           `json:"turn_epoch,omitempty"`
-	Role       Role            `json:"role"`
-	Blocks     []ContentBlock  `json:"blocks"`
-	Native     *NativeEnvelope `json:"native,omitempty"`
-	Usage      *Usage          `json:"usage,omitempty"`
-	CreatedAt  time.Time       `json:"created_at"`
+	ID        string          `json:"id"`
+	Seq       int64           `json:"seq"`
+	TurnEpoch int64           `json:"turn_epoch,omitempty"`
+	Role      Role            `json:"role"`
+	Blocks    []ContentBlock  `json:"blocks"`
+	Native    *NativeEnvelope `json:"native,omitempty"`
+	Usage     *Usage          `json:"usage,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
 }
 
 func (m Message) TextContent() string {

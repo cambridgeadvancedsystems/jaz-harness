@@ -36,7 +36,8 @@ type TurnRequest struct {
 	HostedTools     []schema.HostedTool
 	EnableWebSearch *bool
 	MaxOutputTokens int
-	CachedContent   string // optional Gemini cachedContent name
+	CachedContent   string              // optional Gemini 2.5/3 cachedContent name
+	Heartbeat       func(detail string) // optional liveness callback (e.g. Temporal activity heartbeat)
 }
 
 type TurnResult struct {
@@ -365,12 +366,18 @@ func (e *Engine) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, erro
 	hostedTools := e.resolveHostedTools(th.Provider, req)
 
 	var (
-		totalUsage      schema.Usage
-		lastInputTokens int64
-		assistantText   strings.Builder
-		compacted       bool
-		steps           int
+		totalUsage               schema.Usage
+		lastInputTokens          int64
+		assistantText            strings.Builder
+		compacted                bool
+		steps                    int
+		pendingContinuationToken string
 	)
+	heartbeat := func(detail string) {
+		if req.Heartbeat != nil {
+			req.Heartbeat(detail)
+		}
+	}
 
 	finishErr := func(status string, runErr error) (TurnResult, error) {
 		th.Status = status
@@ -400,6 +407,7 @@ func (e *Engine) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, erro
 		if runCtx.Err() != nil {
 			return finishErr("interrupted", runCtx.Err())
 		}
+		heartbeat(fmt.Sprintf("step:%d", step))
 
 		allMsgs, err := e.store.ListMessages(runCtx, th.ID, 0)
 		if err != nil {
@@ -439,6 +447,12 @@ func (e *Engine) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, erro
 			maxOut = modelSpec.MaxOutputTokens
 		}
 
+		var meta map[string]string
+		if pendingContinuationToken != "" {
+			meta = map[string]string{"continuation_token": pendingContinuationToken}
+			pendingContinuationToken = ""
+		}
+
 		provReq := provider.Request{
 			ThreadID:          th.ID,
 			Model:             th.Model,
@@ -452,9 +466,11 @@ func (e *Engine) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, erro
 			CachedContentName: req.CachedContent,
 			EnableNativeCache: e.cfg.EnableNativeCache,
 			NativeToolSearch:  useNativeToolSearch,
+			Metadata:          meta,
 		}
 
 		resp, err := p.Stream(runCtx, provReq, func(ch provider.StreamChunk) {
+			heartbeat("stream:" + string(ch.Kind))
 			switch ch.Kind {
 			case provider.DeltaText:
 				assistantText.WriteString(ch.Text)
@@ -522,6 +538,7 @@ func (e *Engine) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, erro
 		}
 
 		if len(calls) > 0 {
+			heartbeat(fmt.Sprintf("tools:%d", len(calls)))
 			results := e.executeToolCalls(runCtx, th.ID, epoch, calls)
 			if _, err := e.store.AppendMessage(runCtx, th.ID, schema.Message{
 				TurnEpoch: epoch,
@@ -538,6 +555,13 @@ func (e *Engine) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, erro
 					Blocks:    []schema.ContentBlock{{Type: schema.BlockText, Text: strings.Join(steers, "\n")}},
 				})
 			}
+			continue
+		}
+
+		// Gemini 4 long-decode continuation: resume automatically with continuation token.
+		if tok := strings.TrimSpace(resp.ContinuationToken); tok != "" {
+			pendingContinuationToken = tok
+			heartbeat("continuation")
 			continue
 		}
 
@@ -599,10 +623,10 @@ func (e *Engine) executeToolCalls(ctx context.Context, threadID string, epoch in
 				status = "failed"
 			}
 			e.publishEvent(ctx, threadID, epoch, schema.EventToolCallResult, map[string]any{
-				"call_id": call.CallID,
-				"tool":    call.Name,
-				"status":  status,
-				"output":  out,
+				"call_id":  call.CallID,
+				"tool":     call.Name,
+				"status":   status,
+				"output":   out,
 				"is_error": isErr,
 			})
 			results[i] = schema.ContentBlock{

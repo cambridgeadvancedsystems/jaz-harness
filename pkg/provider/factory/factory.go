@@ -15,9 +15,12 @@ import (
 )
 
 type ProfileConfig struct {
-	Provider       string // openai | codex_oauth | azure_openai | anthropic | vertex_anthropic | bedrock_anthropic | grok | xai | gemini | vertex | vertex_gemini | meta | llama | openrouter | bedrock_openai | openai_compat
+	Provider       string // openai | codex_oauth | azure_openai | anthropic | vertex_anthropic | bedrock_anthropic | grok | xai | gemini | vertex | vertex_gemini | vertex_interactions | meta | llama | openrouter | bedrock_openai | openai_compat
 	BaseURL        string
 	APIKey         string
+	BearerAuth     bool              // Use Authorization: Bearer on Anthropic direct (e.g. OAuth or LLM relays)
+	RelayMode      bool              // Route through a native LLM relay using Bearer auth without cloud project metadata
+	GeminiSurface  gemini.APISurface // "generate_content" (default) | "interactions"
 	CodexOAuth     *auth.CodexOAuthManager
 	VertexProject  string
 	VertexLocation string
@@ -57,58 +60,77 @@ func New(cfg ProfileConfig) (provider.Provider, error) {
 		}), nil
 	case "anthropic":
 		return anthropic.New(anthropic.Config{
-			ProviderID: "anthropic",
-			Mode:       anthropic.ModeDirect,
-			BaseURL:    cfg.BaseURL,
-			APIKey:     cfg.APIKey,
-			HTTPClient: cfg.HTTPClient,
+			ProviderID:   "anthropic",
+			Mode:         anthropic.ModeDirect,
+			BaseURL:      cfg.BaseURL,
+			APIKey:       cfg.APIKey,
+			BearerAuth:   cfg.BearerAuth,
+			RelayMode:    cfg.RelayMode,
+			ExtraHeaders: cfg.ExtraHeaders,
+			HTTPClient:   cfg.HTTPClient,
 		}), nil
 	case "vertex_anthropic":
 		return anthropic.New(anthropic.Config{
 			ProviderID:     "vertex_anthropic",
 			Mode:           anthropic.ModeVertex,
 			BaseURL:        cfg.BaseURL,
+			APIKey:         cfg.APIKey,
+			RelayMode:      cfg.RelayMode,
 			VertexProject:  cfg.VertexProject,
 			VertexLocation: cfg.VertexLocation,
 			VertexToken:    cfg.GCPTokenSource,
+			ExtraHeaders:   cfg.ExtraHeaders,
 			HTTPClient:     cfg.HTTPClient,
 		}), nil
 	case "bedrock_anthropic":
 		return anthropic.New(anthropic.Config{
-			ProviderID: "bedrock_anthropic",
-			Mode:       anthropic.ModeBedrock,
-			BaseURL:    cfg.BaseURL,
-			AWS:        cfg.AWS,
-			HTTPClient: cfg.HTTPClient,
+			ProviderID:   "bedrock_anthropic",
+			Mode:         anthropic.ModeBedrock,
+			BaseURL:      cfg.BaseURL,
+			AWS:          cfg.AWS,
+			ExtraHeaders: cfg.ExtraHeaders,
+			HTTPClient:   cfg.HTTPClient,
 		}), nil
 	case "grok", "xai":
 		return grok.New(grok.Config{
-			ProviderID: "grok",
-			BaseURL:    cfg.BaseURL,
-			APIKey:     cfg.APIKey,
-			HTTPClient: cfg.HTTPClient,
+			ProviderID:   "grok",
+			BaseURL:      cfg.BaseURL,
+			APIKey:       cfg.APIKey,
+			ExtraHeaders: cfg.ExtraHeaders,
+			HTTPClient:   cfg.HTTPClient,
 		}), nil
 	case "gemini":
 		return gemini.New(gemini.Config{
-			ProviderID: "gemini",
-			Mode:       gemini.ModeAIStudio,
-			BaseURL:    cfg.BaseURL,
-			APIKey:     cfg.APIKey,
-			HTTPClient: cfg.HTTPClient,
+			ProviderID:   "gemini",
+			Mode:         gemini.ModeAIStudio,
+			Surface:      cfg.GeminiSurface,
+			BaseURL:      cfg.BaseURL,
+			APIKey:       cfg.APIKey,
+			RelayMode:    cfg.RelayMode,
+			ExtraHeaders: cfg.ExtraHeaders,
+			HTTPClient:   cfg.HTTPClient,
 		}), nil
-	case "vertex", "vertex_gemini":
+	case "vertex", "vertex_gemini", "vertex_interactions":
 		var ts gemini.TokenSource
 		if cfg.GCPTokenSource != nil {
 			ts = gemini.TokenSource(cfg.GCPTokenSource)
 		}
+		surface := cfg.GeminiSurface
+		if kind == "vertex_interactions" && surface == "" {
+			surface = gemini.SurfaceInteractions
+		}
 		return gemini.New(gemini.Config{
-			ProviderID:  "vertex",
-			Mode:        gemini.ModeVertex,
-			BaseURL:     cfg.BaseURL,
-			Project:     cfg.VertexProject,
-			Location:    cfg.VertexLocation,
-			TokenSource: ts,
-			HTTPClient:  cfg.HTTPClient,
+			ProviderID:   "vertex",
+			Mode:         gemini.ModeVertex,
+			Surface:      surface,
+			BaseURL:      cfg.BaseURL,
+			APIKey:       cfg.APIKey,
+			Project:      cfg.VertexProject,
+			Location:     cfg.VertexLocation,
+			TokenSource:  ts,
+			RelayMode:    cfg.RelayMode,
+			ExtraHeaders: cfg.ExtraHeaders,
+			HTTPClient:   cfg.HTTPClient,
 		}), nil
 	case "meta", "llama":
 		return openaicompat.New(openaicompat.Config{
