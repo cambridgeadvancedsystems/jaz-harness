@@ -11,13 +11,14 @@ Idiomatic Go root packages under `github.com/cambridgeadvancedsystems/jaz-harnes
 - `compact` — KV-cache-safe durable compaction, truncation-aware summarization, configurable thresholds, and cross-provider fallback digests
 - `tools` — immutable eager core (`view_image`, `generate_image`, workspace tools) + strictly deferred MCP/plugin BM25 gateway + lazy workspace toolset
 - `mcp` — MCP 2025-11-25 Streamable HTTP / SSE / stdio client + embeddable SEP-2640 Skills over MCP server
-- `executor` — local rooted executor + unforked `codex exec-server` WebSocket JSON-RPC client with capped output buffers
+- `executor` — local rooted executor, pure-Go sandbox exec daemon/client (`executor/execserver`), and legacy `codex exec-server` client with capped output buffers
 - `schema` — canonical messages, lossless `NativeEnvelope`, multimodal tool results, and per-model specs / compaction defaults
 - `store` — pluggable `Store` interface with in-memory and durable JSONL `FileStore`
 - `server` — HTTP + SSE daemon (`?after_seq=` replay) and Go SDK client
 - `auth` — Codex OAuth device-code / refresh-token rotation + pure-Go AWS SigV4
 - `skills` — local, cloud snapshot, and SEP-2640 MCP skills catalog + plugin registry
 - `cmd/jaz-harness` — standalone CLI (`serve`, `run`, `login`)
+- `cmd/jaz-exec-server` — standalone pure-Go sandbox exec daemon (authenticated WebSocket JSON-RPC + `/healthz`)
 
 ## Native Provider Tool Matrix
 
@@ -50,6 +51,24 @@ All providers speak their vendor's native wire protocol directly. Universal imag
 - **KV-Cache-Safe Compaction & Cross-Provider Fallback:** Prefix bytes are never mutated in-place turn-by-turn before a committed checkpoint; quality-tuned thresholds compact 1M/2M models well below raw limits (see [AGENTS.md](AGENTS.md)) with per-model/global overrides, 12,288-token summary caps with truncation detection, native Anthropic/OpenAI server compaction, and guaranteed readable fallback digests when switching providers mid-thread.
 - **Latest MCP + SEP-2640 Skills over MCP (`io.modelcontextprotocol/skills`):** Streamable HTTP, SSE, and stdio MCP client plus embeddable server supporting `skills/list`, `skills/get`, `skill://` URIs, `resources/read`, `resources/directory/read`, SHA-256 verification, multimodal tool outputs, and untrusted-origin framing.
 - **Cloud-Ready Interfaces:** Pluggable `store.Store`, zero-secret `RelayMode` / `BearerAuth` for native LLM relays, configurable `provider.ImageGenerator`, and `TurnRequest.Heartbeat` hooks for durable workers.
+
+## Sandbox Exec Daemon (`jaz-exec-server`)
+
+`cmd/jaz-exec-server` and `executor/execserver` provide a tiny, zero-external-binary, pure-Go sandbox executor daemon and client implementing `executor.Executor` over authenticated WebSocket JSON-RPC 2.0:
+
+- **Fail-Closed Capability-Token Auth + Health Probe:** WebSocket upgrades on `/` and `/ws` require an `Authorization: Bearer <token>` header verified in constant time against a SHA-256 digest (`--token-sha256`, `--token-file`, or `--token`, plus `JAZ_EXEC_TOKEN_SHA256` / `JAZ_EXEC_TOKEN_FILE` / `JAZ_EXEC_TOKEN`). Unauthenticated `GET /healthz` returns readiness metadata (`ok`, `protocol_version`, `workspace_dir`).
+- **Filesystem RPCs (`fs/*`):** Clean POSIX paths (with optional `--restrict-workspace` symlink-aware containment), bounded reads (`--max-read-bytes`, default 32 MiB), atomic writes with automatic parent directory creation (`fs/writeFile`), `fs/readFile`, `fs/listDir`, `fs/stat`, `fs/mkdirAll`, `fs/remove`, and `fs/rename`.
+- **Full Process Lifecycle (`process/*`):** One-shot `process/exec` (`Exec`) with hard timeout enforcement, plus streaming interactive `process/start` (`ExecStart` with `PipeStdin`), `process/write` (`ExecWriteStdin` + optional EOF), `process/read` (`ExecRead` with `afterSeq` + long-poll `waitMs`), and `process/terminate` (`ExecTerminate`). Every process runs in its own Unix process group (`Setpgid`) with `SIGTERM` → grace → `SIGKILL` cleanup on timeout, cancellation, termination, disconnect, or shutdown so orphan child processes never leak.
+
+```bash
+# Run jaz-exec-server with SHA-256 bearer capability auth
+TOKEN="replace-with-random-capability-token"
+TOKEN_HASH="$(printf '%s' "$TOKEN" | shasum -a 256 | awk '{print $1}')"
+go run ./cmd/jaz-exec-server \
+  --listen :8080 \
+  --workspace /workspace \
+  --token-sha256 "$TOKEN_HASH"
+```
 
 ## Quick Start
 

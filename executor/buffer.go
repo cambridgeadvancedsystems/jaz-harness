@@ -11,21 +11,29 @@ import (
 // runaway output cannot OOM the harness worker.
 const DefaultMaxExecOutputBytes = 4 << 20
 
-type cappedBuffer struct {
+// CappedBuffer retains up to limit bytes of stream output and records dropped
+// bytes so runaway command output cannot OOM the worker or sandbox daemon.
+type CappedBuffer struct {
 	buf       bytes.Buffer
 	limit     int
 	dropped   int64
 	truncated bool
 }
 
-func newCappedBuffer(limit int) *cappedBuffer {
+// NewCappedBuffer constructs a CappedBuffer with limit (defaulting to
+// DefaultMaxExecOutputBytes when limit <= 0).
+func NewCappedBuffer(limit int) *CappedBuffer {
 	if limit <= 0 {
 		limit = DefaultMaxExecOutputBytes
 	}
-	return &cappedBuffer{limit: limit}
+	return &CappedBuffer{limit: limit}
 }
 
-func (c *cappedBuffer) Write(p []byte) (int, error) {
+func newCappedBuffer(limit int) *CappedBuffer {
+	return NewCappedBuffer(limit)
+}
+
+func (c *CappedBuffer) Write(p []byte) (int, error) {
 	n := len(p)
 	if n == 0 {
 		return 0, nil
@@ -46,7 +54,7 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-func (c *cappedBuffer) String() string {
+func (c *CappedBuffer) String() string {
 	raw := c.buf.Bytes()
 	if !c.truncated {
 		return string(raw)
@@ -56,4 +64,12 @@ func (c *cappedBuffer) String() string {
 		end--
 	}
 	return string(raw[:end]) + fmt.Sprintf("\n... [stream output capped at %d bytes; %d additional bytes omitted] ...", c.limit, c.dropped)
+}
+
+func (c *CappedBuffer) Truncated() bool {
+	return c.truncated
+}
+
+func (c *CappedBuffer) Dropped() int64 {
+	return c.dropped
 }

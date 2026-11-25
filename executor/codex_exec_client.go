@@ -163,8 +163,8 @@ type CodexExecClient struct {
 }
 
 type execProcState struct {
-	stdout   *cappedBuffer
-	stderr   *cappedBuffer
+	stdout   *CappedBuffer
+	stderr   *CappedBuffer
 	exitCode int
 	exited   bool
 	closed   bool
