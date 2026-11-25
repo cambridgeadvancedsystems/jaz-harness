@@ -145,6 +145,13 @@ func buildGeminiContents(msgs []schema.Message, wireFormat string) []any {
 			}
 		}
 		if len(parts) > 0 {
+			if len(out) > 0 {
+				if prev, ok := out[len(out)-1].(geminiContent); ok && prev.Role == role {
+					prev.Parts = append(prev.Parts, parts...)
+					out[len(out)-1] = prev
+					continue
+				}
+			}
 			out = append(out, geminiContent{Role: role, Parts: parts})
 		}
 	}

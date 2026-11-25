@@ -249,17 +249,23 @@ func (c *Catalog) Read(ctx context.Context, target string) (string, error) {
 	var (
 		matchedSkill *Skill
 		matchedURI   string
+		bestPrefix   int
 	)
 	for _, sk := range c.skills {
-		if q == sk.Name || q == sk.URI || q == sk.MainResource {
+		if q == sk.URI || q == sk.MainResource {
 			matchedSkill = sk
 			matchedURI = sk.MainResource
 			break
 		}
-		if strings.HasPrefix(q, strings.TrimRight(sk.URI, "/")+"/") {
+		if q == sk.Name && matchedSkill == nil {
+			matchedSkill = sk
+			matchedURI = sk.MainResource
+		}
+		prefix := strings.TrimRight(sk.URI, "/") + "/"
+		if strings.HasPrefix(q, prefix) && len(prefix) > bestPrefix {
+			bestPrefix = len(prefix)
 			matchedSkill = sk
 			matchedURI = q
-			break
 		}
 	}
 	c.mu.RUnlock()

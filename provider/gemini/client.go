@@ -289,12 +289,20 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 	)
 
 	flushText := func() {
-		if textBuf.Len() == 0 {
+		if textBuf.Len() == 0 && textSig == "" {
 			return
+		}
+		text := textBuf.String()
+		partMap := map[string]any{"text": text}
+		if textSig != "" {
+			partMap["thoughtSignature"] = textSig
+		}
+		if raw, err := json.Marshal(partMap); err == nil {
+			nativeParts = append(nativeParts, raw)
 		}
 		canonical = append(canonical, schema.ContentBlock{
 			Type:            schema.BlockText,
-			Text:            textBuf.String(),
+			Text:            text,
 			Citations:       citations,
 			ThoughtSignBlob: textSig,
 		})
@@ -303,12 +311,20 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 		citations = nil
 	}
 	flushThought := func() {
-		if thoughtBuf.Len() == 0 {
+		if thoughtBuf.Len() == 0 && thoughtSig == "" {
 			return
+		}
+		thought := thoughtBuf.String()
+		partMap := map[string]any{"thought": true, "text": thought}
+		if thoughtSig != "" {
+			partMap["thoughtSignature"] = thoughtSig
+		}
+		if raw, err := json.Marshal(partMap); err == nil {
+			nativeParts = append(nativeParts, raw)
 		}
 		canonical = append(canonical, schema.ContentBlock{
 			Type:            schema.BlockThinking,
-			Thinking:        thoughtBuf.String(),
+			Thinking:        thought,
 			ThoughtSignBlob: thoughtSig,
 		})
 		thoughtBuf.Reset()
@@ -410,7 +426,6 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 			}
 			for _, rawPart := range cand.Content.Parts {
 				cp := append(json.RawMessage(nil), rawPart...)
-				nativeParts = append(nativeParts, cp)
 
 				var part struct {
 					Text             string `json:"text"`
@@ -431,10 +446,12 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 					} `json:"toolResponse"`
 				}
 				if json.Unmarshal(cp, &part) != nil {
+					nativeParts = append(nativeParts, cp)
 					continue
 				}
 
 				if part.Thought {
+					flushText()
 					if part.ThoughtSignature != "" {
 						thoughtSig = part.ThoughtSignature
 					}
@@ -449,6 +466,7 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 				if part.ToolCall != nil {
 					flushThought()
 					flushText()
+					nativeParts = append(nativeParts, cp)
 					if emit != nil {
 						emit(provider.StreamChunk{Kind: provider.DeltaHostedToolStart, CallID: part.ToolCall.ID, ToolName: part.ToolCall.ToolType})
 					}
@@ -462,6 +480,9 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 					continue
 				}
 				if part.ToolResponse != nil {
+					flushThought()
+					flushText()
+					nativeParts = append(nativeParts, cp)
 					if emit != nil {
 						emit(provider.StreamChunk{Kind: provider.DeltaHostedToolComplete, CallID: part.ToolResponse.ID, ToolName: part.ToolResponse.ToolType})
 					}
@@ -488,6 +509,7 @@ func parseGeminiSSE(r io.Reader, providerID, fallbackModel string, emit provider
 				if part.FunctionCall != nil {
 					flushThought()
 					flushText()
+					nativeParts = append(nativeParts, cp)
 					callID := part.FunctionCall.ID
 					if callID == "" {
 						callID = "gcall_" + uuid.NewString()[:8]

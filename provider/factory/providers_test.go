@@ -762,10 +762,14 @@ func TestGeminiInteractionsStatelessAPIAndRelay(t *testing.T) {
 		sawAuth = r.Header.Get("Authorization")
 		reqBody = string(body)
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "data: {\"event_type\":\"content.delta\",\"delta\":{\"type\":\"thought\",\"thought\":\"Checking\"}}\n\n")
-		fmt.Fprint(w, "data: {\"event_type\":\"content.delta\",\"delta\":{\"type\":\"google_search_call\",\"id\":\"gs_1\"}}\n\n")
-		fmt.Fprint(w, "data: {\"event_type\":\"content.delta\",\"delta\":{\"type\":\"text\",\"text\":\"Part 1\"}}\n\n")
-		fmt.Fprint(w, "data: {\"event_type\":\"interaction.complete\",\"interaction\":{\"id\":\"int_1\",\"model\":\"gemini-4-neon\",\"status\":\"requires_continuation\",\"continuation_token\":\"ctok_abc\",\"outputs\":[{\"type\":\"text\",\"text\":\"Part 1\",\"signature\":\"INT_SIG_1\"}],\"usage\":{\"total_input_tokens\":100,\"total_cached_tokens\":80,\"total_output_tokens\":25,\"total_thought_tokens\":15}}}\n\n")
+		fmt.Fprint(w, "data: {\"event_type\":\"step.start\",\"index\":0,\"step\":{\"type\":\"thought\"}}\n\n")
+		fmt.Fprint(w, "data: {\"event_type\":\"step.delta\",\"index\":0,\"delta\":{\"type\":\"thought_signature\",\"signature\":\"INT_SIG_1\"}}\n\n")
+		fmt.Fprint(w, "data: {\"event_type\":\"step.start\",\"index\":1,\"step\":{\"type\":\"google_search_call\",\"id\":\"gs_1\"}}\n\n")
+		fmt.Fprint(w, "data: {\"event_type\":\"step.delta\",\"index\":1,\"delta\":{\"type\":\"google_search_call\",\"arguments\":{\"queries\":[\"go.dev\"]}}}\n\n")
+		fmt.Fprint(w, "data: {\"event_type\":\"step.start\",\"index\":2,\"step\":{\"type\":\"model_output\"}}\n\n")
+		fmt.Fprint(w, "data: {\"event_type\":\"step.start\",\"index\":3,\"step\":{\"type\":\"model_output\"}}\n\n")
+		fmt.Fprint(w, "data: {\"event_type\":\"step.delta\",\"index\":3,\"delta\":{\"type\":\"text\",\"text\":\"Part 1\"}}\n\n")
+		fmt.Fprint(w, "data: {\"event_type\":\"interaction.completed\",\"interaction\":{\"id\":\"int_1\",\"model\":\"gemini-4-neon\",\"status\":\"requires_continuation\",\"continuation_token\":\"ctok_abc\",\"usage\":{\"total_input_tokens\":100,\"total_cached_tokens\":80,\"total_output_tokens\":25,\"total_thought_tokens\":15}}}\n\n")
 	}))
 	defer srv.Close()
 
@@ -794,6 +798,7 @@ func TestGeminiInteractionsStatelessAPIAndRelay(t *testing.T) {
 		t.Fatalf("unexpected relay interactions path=%q auth=%q", sawPath, sawAuth)
 	}
 	for _, want := range []string{
+		`"type":"user_input"`,
 		`"store":false`,
 		`"stream":true`,
 		`"type":"google_search"`,
@@ -807,6 +812,17 @@ func TestGeminiInteractionsStatelessAPIAndRelay(t *testing.T) {
 	}
 	if res.ContinuationToken != "ctok_abc" || res.Usage.CachedInputTokens != 80 || res.Usage.ReasoningTokens != 15 {
 		t.Fatalf("unexpected interactions response: token=%q usage=%+v", res.ContinuationToken, res.Usage)
+	}
+	// Empty model_output step (index 2) must be omitted and google_search_call must merge delta arguments.
+	nativeJoined := ""
+	for _, raw := range res.Native.RawItems {
+		nativeJoined += string(raw)
+	}
+	if strings.Contains(nativeJoined, `"text":""`) {
+		t.Fatalf("empty model_output step must not be replayed as empty text: %s", nativeJoined)
+	}
+	if !strings.Contains(nativeJoined, `"queries":["go.dev"]`) {
+		t.Fatalf("google_search_call must merge step.delta arguments: %s", nativeJoined)
 	}
 }
 
