@@ -12,11 +12,12 @@ import (
 
 	"github.com/cambridgeadvancedsystems/jaz-harness/provider"
 	"github.com/cambridgeadvancedsystems/jaz-harness/provider/responses"
+	"github.com/cambridgeadvancedsystems/jaz-harness/schema"
 )
 
 const (
 	DefaultBaseURL = "https://api.x.ai/v1"
-	DefaultModel   = "grok-4.7"
+	DefaultModel   = schema.DefaultGrokModel
 	WireFormat     = "xai_responses"
 )
 

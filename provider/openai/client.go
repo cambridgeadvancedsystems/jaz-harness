@@ -15,11 +15,12 @@ import (
 	"github.com/cambridgeadvancedsystems/jaz-harness/auth"
 	"github.com/cambridgeadvancedsystems/jaz-harness/provider"
 	"github.com/cambridgeadvancedsystems/jaz-harness/provider/responses"
+	"github.com/cambridgeadvancedsystems/jaz-harness/schema"
 )
 
 const (
 	DefaultBaseURL     = "https://api.openai.com/v1"
-	DefaultModel       = "gpt-6.2-sol"
+	DefaultModel       = schema.DefaultOpenAIModel
 	WireFormat         = "openai_responses"
 	turnStateHeaderKey = "x-codex-turn-state"
 	maxStickyStates    = 1024

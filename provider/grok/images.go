@@ -14,7 +14,7 @@ import (
 	"github.com/cambridgeadvancedsystems/jaz-harness/schema"
 )
 
-const DefaultImageModel = "grok-imagine-image-2.0"
+const DefaultImageModel = schema.DefaultGrokImageModel
 
 // GenerateImage implements provider.ImageGenerator using xAI's native image
 // endpoints (`POST /v1/images/generations` and `POST /v1/images/edits`).

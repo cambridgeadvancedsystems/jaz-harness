@@ -19,11 +19,21 @@ import (
 const (
 	// DefaultImageModel tracks OpenAI's latest official Images API flagship model
 	// (GPT Image 2.6 Sunburst: high detail, typography, transparent backgrounds, and multi-reference consistency).
-	DefaultImageModel = "gpt-image-2.6-sunburst"
+	DefaultImageModel = schema.DefaultOpenAIImageModel
 	// DefaultCodexImageModel matches Codex's upstream image-generation extension
 	// (`codex-rs/ext/image-generation/src/tool.rs` `IMAGE_MODEL`).
-	DefaultCodexImageModel = "gpt-image-2"
+	DefaultCodexImageModel = schema.DefaultCodexImageModel
 )
+
+type normalizedImageParams struct {
+	model         string
+	prompt        string
+	background    string
+	quality       string
+	size          string
+	outputFormat  string
+	inputFidelity string
+}
 
 // DefaultImageModel returns the active client's default image generation model
 // (`gpt-image-2` on Codex OAuth to match upstream Codex, `gpt-image-2.6-sunburst`
@@ -40,34 +50,27 @@ func (c *Client) DefaultImageModel() string {
 // Reference images use Codex's JSON `{images: [{image_url}]}` contract on
 // Codex OAuth and multipart `image[]` (or JSON when URL-only) on direct OpenAI.
 func (c *Client) GenerateImage(ctx context.Context, req provider.ImageGenerationRequest) (provider.ImageGenerationResponse, error) {
-	prompt := strings.TrimSpace(req.Prompt)
-	if prompt == "" {
-		return provider.ImageGenerationResponse{}, errors.New("openai image generation: prompt is required")
+	params, err := c.prepareImageParams(req)
+	if err != nil {
+		return provider.ImageGenerationResponse{}, err
 	}
-	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		model = c.DefaultImageModel()
-	}
-	background := resolveImageBackground(req)
-	outputFormat := resolveImageOutputFormat(model, background, req.OutputFormat, c.isCodexOAuth())
 
 	var (
 		endpoint    string
 		body        []byte
 		contentType string
-		err         error
 	)
 	if len(req.ReferenceImages) == 0 {
 		endpoint = c.cfg.BaseURL + "/images/generations"
 		contentType = "application/json"
-		body, err = buildImageGenerateBody(model, prompt, background, outputFormat, req)
+		body, err = buildImageGenerateBody(params)
 	} else {
 		endpoint = c.cfg.BaseURL + "/images/edits"
 		if c.isCodexOAuth() || !allHaveInlineImageBytes(req.ReferenceImages) {
 			contentType = "application/json"
-			body, err = buildImageEditJSONBody(model, prompt, background, outputFormat, req)
+			body, err = buildImageEditJSONBody(params, req.ReferenceImages)
 		} else {
-			body, contentType, err = buildImageEditMultipartBody(model, prompt, background, outputFormat, req)
+			body, contentType, err = buildImageEditMultipartBody(params, req.ReferenceImages)
 		}
 	}
 	if err != nil {
@@ -115,7 +118,7 @@ func (c *Client) GenerateImage(ctx context.Context, req provider.ImageGeneration
 	}
 
 	out := provider.ImageGenerationResponse{
-		Model:    model,
+		Model:    params.model,
 		Metadata: map[string]any{},
 	}
 	if reqID := strings.TrimSpace(resp.Header.Get("x-codex-imagegen-request-id")); reqID != "" {
@@ -156,6 +159,35 @@ func (c *Client) GenerateImage(ctx context.Context, req provider.ImageGeneration
 	return out, nil
 }
 
+func (c *Client) prepareImageParams(req provider.ImageGenerationRequest) (normalizedImageParams, error) {
+	prompt := strings.TrimSpace(req.Prompt)
+	if prompt == "" {
+		return normalizedImageParams{}, errors.New("openai image generation: prompt is required")
+	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = c.DefaultImageModel()
+	}
+	background := resolveImageBackground(req)
+	outputFormat, err := resolveImageOutputFormat(background, req.OutputFormat, c.isCodexOAuth())
+	if err != nil {
+		return normalizedImageParams{}, err
+	}
+	inputFidelity := ""
+	if supportsInputFidelity(model) {
+		inputFidelity = strings.ToLower(strings.TrimSpace(req.InputFidelity))
+	}
+	return normalizedImageParams{
+		model:         model,
+		prompt:        prompt,
+		background:    background,
+		quality:       strings.ToLower(strings.TrimSpace(req.Quality)),
+		size:          strings.TrimSpace(req.Size),
+		outputFormat:  outputFormat,
+		inputFidelity: inputFidelity,
+	}, nil
+}
+
 func resolveImageBackground(req provider.ImageGenerationRequest) string {
 	if bg := strings.ToLower(strings.TrimSpace(req.Background)); bg != "" {
 		return bg
@@ -170,48 +202,57 @@ func resolveImageBackground(req provider.ImageGenerationRequest) string {
 // parameter. OpenAI GPT Image 2 / 2.5 / 2.6 models always preserve reference
 // images at high fidelity and deprecate/reject `input_fidelity` (matching Codex).
 func supportsInputFidelity(model string) bool {
-	norm := strings.ToLower(strings.TrimSpace(model))
+	norm := schema.NormalizeModelSlug(model)
 	return norm != "gpt-image-2" && !strings.HasPrefix(norm, "gpt-image-2.") && !strings.HasPrefix(norm, "gpt-image-2-")
 }
 
-// resolveImageOutputFormat ensures transparent backgrounds on direct OpenAI
-// GPT Image 2.5/2.6 requests specify an alpha-capable format (`png`) when unset.
-func resolveImageOutputFormat(model, background, explicit string, codexOAuth bool) string {
-	if fmtVal := strings.ToLower(strings.TrimSpace(explicit)); fmtVal != "" {
-		return fmtVal
+// resolveImageOutputFormat validates transparent-background format compatibility
+// and defaults unset direct OpenAI/Azure transparent requests to alpha-capable `png`.
+// Codex OAuth omits `output_format` unless explicitly requested (matching codex-api).
+func resolveImageOutputFormat(background, explicit string, codexOAuth bool) (string, error) {
+	fmtVal := strings.ToLower(strings.TrimSpace(explicit))
+	if background == "transparent" && (fmtVal == "jpeg" || fmtVal == "jpg") {
+		return "", errors.New("openai image generation: transparent background requires an alpha-capable output_format (png or webp)")
+	}
+	if fmtVal != "" {
+		return fmtVal, nil
 	}
 	if !codexOAuth && background == "transparent" {
-		norm := strings.ToLower(strings.TrimSpace(model))
-		if strings.HasPrefix(norm, "gpt-image-2.") {
-			return "png"
-		}
+		return "png", nil
 	}
-	return ""
+	return "", nil
 }
 
-func buildImageGenerateBody(model, prompt, background, outputFormat string, req provider.ImageGenerationRequest) ([]byte, error) {
+func applyOptionalImageFields(payload map[string]any, p normalizedImageParams, includeInputFidelity bool) {
+	if p.background != "" {
+		payload["background"] = p.background
+	}
+	if p.quality != "" {
+		payload["quality"] = p.quality
+	}
+	if p.size != "" {
+		payload["size"] = p.size
+	}
+	if p.outputFormat != "" {
+		payload["output_format"] = p.outputFormat
+	}
+	if includeInputFidelity && p.inputFidelity != "" {
+		payload["input_fidelity"] = p.inputFidelity
+	}
+}
+
+func buildImageGenerateBody(p normalizedImageParams) ([]byte, error) {
 	payload := map[string]any{
-		"model":  model,
-		"prompt": prompt,
+		"model":  p.model,
+		"prompt": p.prompt,
 	}
-	if background != "" {
-		payload["background"] = background
-	}
-	if req.Quality != "" {
-		payload["quality"] = strings.ToLower(strings.TrimSpace(req.Quality))
-	}
-	if req.Size != "" {
-		payload["size"] = strings.TrimSpace(req.Size)
-	}
-	if outputFormat != "" {
-		payload["output_format"] = outputFormat
-	}
+	applyOptionalImageFields(payload, p, false)
 	return json.Marshal(payload)
 }
 
-func buildImageEditJSONBody(model, prompt, background, outputFormat string, req provider.ImageGenerationRequest) ([]byte, error) {
-	images := make([]map[string]any, 0, len(req.ReferenceImages))
-	for _, ref := range req.ReferenceImages {
+func buildImageEditJSONBody(p normalizedImageParams, refs []schema.ImageSource) ([]byte, error) {
+	images := make([]map[string]any, 0, len(refs))
+	for _, ref := range refs {
 		if u := ref.DataURL(); u != "" {
 			images = append(images, map[string]any{"image_url": u})
 		}
@@ -220,25 +261,11 @@ func buildImageEditJSONBody(model, prompt, background, outputFormat string, req 
 		return nil, errors.New("openai image edit: no valid reference images")
 	}
 	payload := map[string]any{
-		"model":  model,
-		"prompt": prompt,
+		"model":  p.model,
+		"prompt": p.prompt,
 		"images": images,
 	}
-	if background != "" {
-		payload["background"] = background
-	}
-	if req.Quality != "" {
-		payload["quality"] = strings.ToLower(strings.TrimSpace(req.Quality))
-	}
-	if req.Size != "" {
-		payload["size"] = strings.TrimSpace(req.Size)
-	}
-	if outputFormat != "" {
-		payload["output_format"] = outputFormat
-	}
-	if req.InputFidelity != "" && supportsInputFidelity(model) {
-		payload["input_fidelity"] = strings.ToLower(strings.TrimSpace(req.InputFidelity))
-	}
+	applyOptionalImageFields(payload, p, true)
 	return json.Marshal(payload)
 }
 
@@ -254,38 +281,31 @@ func allHaveInlineImageBytes(refs []schema.ImageSource) bool {
 	return true
 }
 
-func buildImageEditMultipartBody(model, prompt, background, outputFormat string, req provider.ImageGenerationRequest) ([]byte, string, error) {
+func buildImageEditMultipartBody(p normalizedImageParams, refs []schema.ImageSource) ([]byte, string, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
-	writeField := func(name, val string) error {
-		if val == "" {
-			return nil
-		}
-		return mw.WriteField(name, val)
-	}
-	inputFidelity := ""
-	if supportsInputFidelity(model) {
-		inputFidelity = strings.ToLower(strings.TrimSpace(req.InputFidelity))
-	}
 	for _, kv := range [][2]string{
-		{"model", model},
-		{"prompt", prompt},
-		{"background", background},
-		{"quality", strings.ToLower(strings.TrimSpace(req.Quality))},
-		{"size", strings.TrimSpace(req.Size)},
-		{"output_format", outputFormat},
-		{"input_fidelity", inputFidelity},
+		{"model", p.model},
+		{"prompt", p.prompt},
+		{"background", p.background},
+		{"quality", p.quality},
+		{"size", p.size},
+		{"output_format", p.outputFormat},
+		{"input_fidelity", p.inputFidelity},
 	} {
-		if err := writeField(kv[0], kv[1]); err != nil {
+		if kv[1] == "" {
+			continue
+		}
+		if err := mw.WriteField(kv[0], kv[1]); err != nil {
 			return nil, "", err
 		}
 	}
 	fieldName := "image[]"
-	if len(req.ReferenceImages) == 1 {
+	if len(refs) == 1 {
 		fieldName = "image"
 	}
 	attached := 0
-	for i, ref := range req.ReferenceImages {
+	for i, ref := range refs {
 		raw, mt, err := decodeReferenceImageBytes(ref)
 		if err != nil {
 			return nil, "", fmt.Errorf("openai image edit reference %d: %w", i, err)

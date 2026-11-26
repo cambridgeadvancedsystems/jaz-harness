@@ -24,7 +24,7 @@ Across **all** providers and harness surfaces (chat, reasoning, compaction, CLI 
 Whenever adding a provider, bumping model catalogs, or modifying `DefaultModel` / `DefaultImageModel`:
 
 1. Re-check both the upstream coding harnesses (`codex-rs/models-manager/models.json` and `codex-rs/ext/image-generation`, Claude Code model catalog, Grok CLI default model settings, Antigravity / Vertex Gemini defaults) and official vendor API documentation.
-2. Keep every provider package's exported default constants (`openai.DefaultModel`, `openai.DefaultImageModel`, `openai.DefaultCodexImageModel`, `anthropic.DefaultModel`, `grok.DefaultModel`, `grok.DefaultImageModel`, `gemini.DefaultModel`, `gemini.DefaultImageModel`, `openaicompat.DefaultMetaModel`, `openaicompat.DefaultOpenRouterModel`, `openaicompat.DefaultBedrockOpenAIModel`) synchronized with `schema.ProviderDefaults()`, `schema.DefaultModelForProvider()`, `schema.DefaultImageModelForProvider()`, and `schema/models.go` model specs (enforced by unit tests in `provider/factory`).
+2. Maintain the single source of truth in `schema/defaults.go` (`schema.Default*Model`, `schema.ProviderDefaults()`, `schema.DefaultModelForProvider()`, `schema.DefaultImageModelForProvider()`), re-exported as compile-time constants by every provider package (`openai`, `anthropic`, `grok`, `gemini`, `openaicompat`), and keep `schema/models.go` specs synchronized (verified by unit tests in `provider/factory`).
 3. Update both the `Model Defaults & Upstream Parity` table and `Native Provider Tool Matrix` in `README.md` plus the compaction table below in the same change.
 
 ## Maintained Per-Model Compaction-Threshold Recipe

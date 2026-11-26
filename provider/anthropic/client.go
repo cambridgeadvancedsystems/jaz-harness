@@ -14,11 +14,12 @@ import (
 
 	"github.com/cambridgeadvancedsystems/jaz-harness/auth"
 	"github.com/cambridgeadvancedsystems/jaz-harness/provider"
+	"github.com/cambridgeadvancedsystems/jaz-harness/schema"
 )
 
 const (
 	DefaultBaseURL       = "https://api.anthropic.com"
-	DefaultModel         = "claude-opus-5-5"
+	DefaultModel         = schema.DefaultAnthropicModel
 	DefaultAPIVersion    = "2023-06-01"
 	VertexAPIVersion     = "vertex-2023-10-16"
 	BedrockAPIVersion    = "bedrock-2023-05-31"

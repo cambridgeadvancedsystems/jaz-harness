@@ -746,4 +746,70 @@ func TestProviderDefaultModelConstantsAndImageParameterHandling(t *testing.T) {
 	if !strings.Contains(lastEditBody, `"model":"gpt-image-1.5"`) || !strings.Contains(lastEditBody, `"input_fidelity":"high"`) {
 		t.Fatalf("legacy gpt-image-1.5 edit must preserve input_fidelity: %s", lastEditBody)
 	}
+
+	// Provider-prefixed gpt-image-2.6 slug must also omit input_fidelity.
+	_, err = imgGen.GenerateImage(context.Background(), provider.ImageGenerationRequest{
+		Model:           "openai/gpt-image-2.6-flare",
+		Prompt:          "Refine edges",
+		InputFidelity:   "high",
+		ReferenceImages: []schema.ImageSource{{URL: "https://example.com/ref.png"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(lastEditBody, `"input_fidelity"`) {
+		t.Fatalf("prefixed gpt-image-2.6 edit must omit input_fidelity: %s", lastEditBody)
+	}
+
+	// Transparent background with explicit jpeg output_format must fail closed locally.
+	if _, err := imgGen.GenerateImage(context.Background(), provider.ImageGenerationRequest{
+		Prompt:                "Sticker cutout",
+		TransparentBackground: true,
+		OutputFormat:          "jpeg",
+	}); err == nil {
+		t.Fatal("expected error for transparent background with jpeg output_format")
+	}
+
+	// Azure OpenAI shares direct OpenAI image defaults and parameter handling.
+	azureProv, err := factory.New(factory.ProfileConfig{
+		Provider:   "azure_openai",
+		BaseURL:    srv.URL + "/v1",
+		APIKey:     "az-test",
+		HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	azRes, err := azureProv.(provider.ImageGenerator).GenerateImage(context.Background(), provider.ImageGenerationRequest{
+		Prompt:                "Azure badge",
+		TransparentBackground: true,
+	})
+	if err != nil || azRes.Model != openai.DefaultImageModel || !strings.Contains(lastGenBody, `"output_format":"png"`) {
+		t.Fatalf("azure_openai GenerateImage failed: model=%q err=%v body=%s", azRes.Model, err, lastGenBody)
+	}
+
+	// Codex OAuth transparent request omits output_format unless explicitly set (matches codex-api).
+	mgr := auth.NewCodexOAuthManager(auth.CodexOAuthConfig{HTTPClient: srv.Client()})
+	mgr.LoadFromMemory(auth.CodexAuthFile{
+		Tokens: &auth.CodexTokenSet{AccessToken: "codex_tok", AccountID: "acct_1"},
+	})
+	codexProv, err := factory.New(factory.ProfileConfig{
+		Provider:   "codex_oauth",
+		BaseURL:    srv.URL + "/v1",
+		CodexOAuth: mgr,
+		HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexRes, err := codexProv.(provider.ImageGenerator).GenerateImage(context.Background(), provider.ImageGenerationRequest{
+		Prompt:                "Codex transparent badge",
+		TransparentBackground: true,
+	})
+	if err != nil || codexRes.Model != openai.DefaultCodexImageModel {
+		t.Fatalf("codex_oauth GenerateImage failed: model=%q err=%v", codexRes.Model, err)
+	}
+	if !strings.Contains(lastGenBody, `"model":"`+openai.DefaultCodexImageModel+`"`) || strings.Contains(lastGenBody, `"output_format"`) {
+		t.Fatalf("codex_oauth transparent request must omit auto output_format: %s", lastGenBody)
+	}
 }
