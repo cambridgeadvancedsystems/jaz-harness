@@ -18,9 +18,12 @@ import (
 )
 
 const (
-	MetaLlamaBaseURL  = "https://api.llama.com/compat/v1"
-	OpenRouterBaseURL = "https://openrouter.ai/api/v1"
-	WireFormat        = "openai_chat_completions"
+	MetaLlamaBaseURL          = "https://api.llama.com/compat/v1"
+	OpenRouterBaseURL         = "https://openrouter.ai/api/v1"
+	DefaultMetaModel          = "Llama-4-Maverick-17B-128E-Instruct-FP8"
+	DefaultOpenRouterModel    = "openai/gpt-6.2-sol"
+	DefaultBedrockOpenAIModel = "openai.gpt-oss-120b"
+	WireFormat                = "openai_chat_completions"
 )
 
 type Flavor string

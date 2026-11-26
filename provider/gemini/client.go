@@ -19,6 +19,7 @@ import (
 
 const (
 	DefaultAIStudioURL = "https://generativelanguage.googleapis.com"
+	DefaultModel       = "gemini-4-neon"
 	WireFormat         = "gemini_generate_content"
 )
 

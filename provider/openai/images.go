@@ -16,7 +16,24 @@ import (
 	"github.com/cambridgeadvancedsystems/jaz-harness/schema"
 )
 
-const DefaultImageModel = "gpt-image-1.5"
+const (
+	// DefaultImageModel tracks OpenAI's latest official Images API flagship model
+	// (GPT Image 2.6 Sunburst: high detail, typography, transparent backgrounds, and multi-reference consistency).
+	DefaultImageModel = "gpt-image-2.6-sunburst"
+	// DefaultCodexImageModel matches Codex's upstream image-generation extension
+	// (`codex-rs/ext/image-generation/src/tool.rs` `IMAGE_MODEL`).
+	DefaultCodexImageModel = "gpt-image-2"
+)
+
+// DefaultImageModel returns the active client's default image generation model
+// (`gpt-image-2` on Codex OAuth to match upstream Codex, `gpt-image-2.6-sunburst`
+// on direct OpenAI / Azure OpenAI).
+func (c *Client) DefaultImageModel() string {
+	if c.isCodexOAuth() {
+		return DefaultCodexImageModel
+	}
+	return DefaultImageModel
+}
 
 // GenerateImage implements provider.ImageGenerator using OpenAI / Codex native
 // image endpoints (`POST /images/generations` and `POST /images/edits`).
@@ -29,9 +46,10 @@ func (c *Client) GenerateImage(ctx context.Context, req provider.ImageGeneration
 	}
 	model := strings.TrimSpace(req.Model)
 	if model == "" {
-		model = DefaultImageModel
+		model = c.DefaultImageModel()
 	}
 	background := resolveImageBackground(req)
+	outputFormat := resolveImageOutputFormat(model, background, req.OutputFormat, c.isCodexOAuth())
 
 	var (
 		endpoint    string
@@ -42,14 +60,14 @@ func (c *Client) GenerateImage(ctx context.Context, req provider.ImageGeneration
 	if len(req.ReferenceImages) == 0 {
 		endpoint = c.cfg.BaseURL + "/images/generations"
 		contentType = "application/json"
-		body, err = buildImageGenerateBody(model, prompt, background, req)
+		body, err = buildImageGenerateBody(model, prompt, background, outputFormat, req)
 	} else {
 		endpoint = c.cfg.BaseURL + "/images/edits"
 		if c.isCodexOAuth() || !allHaveInlineImageBytes(req.ReferenceImages) {
 			contentType = "application/json"
-			body, err = buildImageEditJSONBody(model, prompt, background, req)
+			body, err = buildImageEditJSONBody(model, prompt, background, outputFormat, req)
 		} else {
-			body, contentType, err = buildImageEditMultipartBody(model, prompt, background, req)
+			body, contentType, err = buildImageEditMultipartBody(model, prompt, background, outputFormat, req)
 		}
 	}
 	if err != nil {
@@ -148,7 +166,30 @@ func resolveImageBackground(req provider.ImageGenerationRequest) string {
 	return ""
 }
 
-func buildImageGenerateBody(model, prompt, background string, req provider.ImageGenerationRequest) ([]byte, error) {
+// supportsInputFidelity reports whether model accepts the legacy `input_fidelity`
+// parameter. OpenAI GPT Image 2 / 2.5 / 2.6 models always preserve reference
+// images at high fidelity and deprecate/reject `input_fidelity` (matching Codex).
+func supportsInputFidelity(model string) bool {
+	norm := strings.ToLower(strings.TrimSpace(model))
+	return norm != "gpt-image-2" && !strings.HasPrefix(norm, "gpt-image-2.") && !strings.HasPrefix(norm, "gpt-image-2-")
+}
+
+// resolveImageOutputFormat ensures transparent backgrounds on direct OpenAI
+// GPT Image 2.5/2.6 requests specify an alpha-capable format (`png`) when unset.
+func resolveImageOutputFormat(model, background, explicit string, codexOAuth bool) string {
+	if fmtVal := strings.ToLower(strings.TrimSpace(explicit)); fmtVal != "" {
+		return fmtVal
+	}
+	if !codexOAuth && background == "transparent" {
+		norm := strings.ToLower(strings.TrimSpace(model))
+		if strings.HasPrefix(norm, "gpt-image-2.") {
+			return "png"
+		}
+	}
+	return ""
+}
+
+func buildImageGenerateBody(model, prompt, background, outputFormat string, req provider.ImageGenerationRequest) ([]byte, error) {
 	payload := map[string]any{
 		"model":  model,
 		"prompt": prompt,
@@ -162,13 +203,13 @@ func buildImageGenerateBody(model, prompt, background string, req provider.Image
 	if req.Size != "" {
 		payload["size"] = strings.TrimSpace(req.Size)
 	}
-	if req.OutputFormat != "" {
-		payload["output_format"] = strings.ToLower(strings.TrimSpace(req.OutputFormat))
+	if outputFormat != "" {
+		payload["output_format"] = outputFormat
 	}
 	return json.Marshal(payload)
 }
 
-func buildImageEditJSONBody(model, prompt, background string, req provider.ImageGenerationRequest) ([]byte, error) {
+func buildImageEditJSONBody(model, prompt, background, outputFormat string, req provider.ImageGenerationRequest) ([]byte, error) {
 	images := make([]map[string]any, 0, len(req.ReferenceImages))
 	for _, ref := range req.ReferenceImages {
 		if u := ref.DataURL(); u != "" {
@@ -192,7 +233,10 @@ func buildImageEditJSONBody(model, prompt, background string, req provider.Image
 	if req.Size != "" {
 		payload["size"] = strings.TrimSpace(req.Size)
 	}
-	if req.InputFidelity != "" {
+	if outputFormat != "" {
+		payload["output_format"] = outputFormat
+	}
+	if req.InputFidelity != "" && supportsInputFidelity(model) {
 		payload["input_fidelity"] = strings.ToLower(strings.TrimSpace(req.InputFidelity))
 	}
 	return json.Marshal(payload)
@@ -210,7 +254,7 @@ func allHaveInlineImageBytes(refs []schema.ImageSource) bool {
 	return true
 }
 
-func buildImageEditMultipartBody(model, prompt, background string, req provider.ImageGenerationRequest) ([]byte, string, error) {
+func buildImageEditMultipartBody(model, prompt, background, outputFormat string, req provider.ImageGenerationRequest) ([]byte, string, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	writeField := func(name, val string) error {
@@ -219,13 +263,18 @@ func buildImageEditMultipartBody(model, prompt, background string, req provider.
 		}
 		return mw.WriteField(name, val)
 	}
+	inputFidelity := ""
+	if supportsInputFidelity(model) {
+		inputFidelity = strings.ToLower(strings.TrimSpace(req.InputFidelity))
+	}
 	for _, kv := range [][2]string{
 		{"model", model},
 		{"prompt", prompt},
 		{"background", background},
 		{"quality", strings.ToLower(strings.TrimSpace(req.Quality))},
 		{"size", strings.TrimSpace(req.Size)},
-		{"input_fidelity", strings.ToLower(strings.TrimSpace(req.InputFidelity))},
+		{"output_format", outputFormat},
+		{"input_fidelity", inputFidelity},
 	} {
 		if err := writeField(kv[0], kv[1]); err != nil {
 			return nil, "", err

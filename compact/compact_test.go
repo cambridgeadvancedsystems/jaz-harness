@@ -162,7 +162,7 @@ func TestAutoCompactThresholdRecipeAndOverrides(t *testing.T) {
 	eng := NewEngine(Config{})
 
 	// 1M Anthropic / Fable models intentionally compact well below 1M (380k).
-	for _, m := range []string{"claude-opus-5-5", "claude-fable-5-2", "claude-sonnet-4-5", "anthropic/claude-opus-4-5"} {
+	for _, m := range []string{"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2", "claude-sonnet-4-5", "anthropic/claude-opus-4-5"} {
 		spec := schema.LookupModel("anthropic", m)
 		if got := eng.ResolveAutoCompactThreshold(spec); got != 380_000 {
 			t.Fatalf("%s default auto-compact threshold = %d, want 380000", m, got)
@@ -175,18 +175,31 @@ func TestAutoCompactThresholdRecipeAndOverrides(t *testing.T) {
 	if got := eng.ResolveAutoCompactThreshold(schema.LookupModel("openai", "gpt-6.2-astra")); got != 244_800 {
 		t.Fatalf("gpt-6.2-astra threshold = %d, want 244800", got)
 	}
-	if got := eng.ResolveAutoCompactThreshold(schema.LookupModel("openai", "gpt-6.1-sol")); got != 450_000 {
-		t.Fatalf("gpt-6.1-sol threshold = %d, want 450000", got)
+	for _, m := range []string{"gpt-6.2-sol", "gpt-6.1-sol", "gpt-6.1-terra"} {
+		if got := eng.ResolveAutoCompactThreshold(schema.LookupModel("openai", m)); got != 450_000 {
+			t.Fatalf("%s threshold = %d, want 450000", m, got)
+		}
 	}
-	// 1M Gemini 4 and 2M Grok-4-fast stay capped at 400k; 256k Grok-4 uses 85% (217.6k).
-	if got := eng.ResolveAutoCompactThreshold(schema.LookupModel("vertex", "google/gemini-4-neon")); got != 400_000 {
-		t.Fatalf("gemini-4-neon threshold = %d, want 400000", got)
+	// 1M Gemini 4 / 3.5 and 1M/2M Grok models stay capped at 400k; 500k Grok 4.7/4.6 use 85% (425k); 256k Grok 4/build use 85% (217.6k).
+	for _, m := range []string{"google/gemini-4-neon", "google/gemini-4-carbon", "gemini-4-hydrogen", "gemini-3.5-flash-lite"} {
+		if got := eng.ResolveAutoCompactThreshold(schema.LookupModel("vertex", m)); got != 400_000 {
+			t.Fatalf("%s threshold = %d, want 400000", m, got)
+		}
 	}
-	if got := eng.ResolveAutoCompactThreshold(schema.LookupModel("grok", "grok-4")); got != 217_600 {
-		t.Fatalf("grok-4 threshold = %d, want 217600", got)
+	for _, m := range []string{"grok-4.7", "grok-4.6"} {
+		if got := eng.ResolveAutoCompactThreshold(schema.LookupModel("grok", m)); got != 425_000 {
+			t.Fatalf("%s threshold = %d, want 425000", m, got)
+		}
 	}
-	if got := eng.ResolveAutoCompactThreshold(schema.LookupModel("grok", "grok-4-fast")); got != 400_000 {
-		t.Fatalf("grok-4-fast threshold = %d, want 400000", got)
+	for _, m := range []string{"grok-4", "grok-build-0.1"} {
+		if got := eng.ResolveAutoCompactThreshold(schema.LookupModel("grok", m)); got != 217_600 {
+			t.Fatalf("%s threshold = %d, want 217600", m, got)
+		}
+	}
+	for _, m := range []string{"grok-4-fast", "grok-4.3", "grok-4.20-0309-reasoning"} {
+		if got := eng.ResolveAutoCompactThreshold(schema.LookupModel("grok", m)); got != 400_000 {
+			t.Fatalf("%s threshold = %d, want 400000", m, got)
+		}
 	}
 
 	// Per-model override > global token override > fraction override, clamped to <=90% of window.

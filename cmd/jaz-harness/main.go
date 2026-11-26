@@ -183,9 +183,14 @@ func runPrompt(args []string) {
 	serverURL := fs.String("server", "", "Remote jaz-harness server URL (empty = embedded)")
 	authToken := fs.String("auth-token", os.Getenv("JAZ_HARNESS_TOKEN"), "Optional Bearer auth token")
 	provName := fs.String("provider", "openai", "Provider ID")
-	model := fs.String("model", "gpt-5.4", "Model ID")
+	model := fs.String("model", "", "Model ID (defaults to the provider's latest official model)")
 	effort := fs.String("effort", "", "Reasoning effort (low|medium|high|xhigh)")
 	_ = fs.Parse(args)
+
+	selectedModel := strings.TrimSpace(*model)
+	if selectedModel == "" {
+		selectedModel = schema.DefaultModelForProvider(*provName)
+	}
 
 	prompt := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if prompt == "" {
@@ -197,7 +202,7 @@ func runPrompt(args []string) {
 		cli := server.NewClient(*serverURL, *authToken, nil)
 		th, err := cli.CreateThread(ctx, schema.Thread{
 			Provider:        *provName,
-			Model:           *model,
+			Model:           selectedModel,
 			ReasoningEffort: *effort,
 		})
 		if err != nil {
@@ -222,7 +227,7 @@ func runPrompt(args []string) {
 
 	th, err := eng.CreateThread(ctx, schema.Thread{
 		Provider:        *provName,
-		Model:           *model,
+		Model:           selectedModel,
 		ReasoningEffort: *effort,
 	})
 	if err != nil {

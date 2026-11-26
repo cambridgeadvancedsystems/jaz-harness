@@ -19,6 +19,7 @@ import (
 
 const (
 	DefaultBaseURL     = "https://api.openai.com/v1"
+	DefaultModel       = "gpt-6.2-sol"
 	WireFormat         = "openai_responses"
 	turnStateHeaderKey = "x-codex-turn-state"
 	maxStickyStates    = 1024

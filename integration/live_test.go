@@ -83,28 +83,28 @@ func TestLiveProviders(t *testing.T) {
 			cases = append(cases, liveCase{
 				name:   "codex_oauth",
 				cfg:    factory.ProfileConfig{Provider: "codex_oauth", CodexOAuth: auth.NewCodexOAuthManager(auth.CodexOAuthConfig{AuthPath: p})},
-				model:  "gpt-6.1-sol",
+				model:  schema.DefaultModelForProvider("codex_oauth"),
 				effort: "low",
 			})
 		}
 	}
 	if key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); key != "" {
-		cases = append(cases, liveCase{name: "openai", cfg: factory.ProfileConfig{Provider: "openai", APIKey: key}, model: "gpt-5.4", effort: "low"})
+		cases = append(cases, liveCase{name: "openai", cfg: factory.ProfileConfig{Provider: "openai", APIKey: key}, model: schema.DefaultModelForProvider("openai"), effort: "low"})
 	}
 	if key := strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")); key != "" {
-		cases = append(cases, liveCase{name: "anthropic", cfg: factory.ProfileConfig{Provider: "anthropic", APIKey: key}, model: "claude-sonnet-4-5", effort: "low"})
+		cases = append(cases, liveCase{name: "anthropic", cfg: factory.ProfileConfig{Provider: "anthropic", APIKey: key}, model: schema.DefaultModelForProvider("anthropic"), effort: "low"})
 	}
 	if key := strings.TrimSpace(os.Getenv("XAI_API_KEY")); key != "" {
-		cases = append(cases, liveCase{name: "grok", cfg: factory.ProfileConfig{Provider: "grok", APIKey: key}, model: "grok-4", effort: "low"})
+		cases = append(cases, liveCase{name: "grok", cfg: factory.ProfileConfig{Provider: "grok", APIKey: key}, model: schema.DefaultModelForProvider("grok"), effort: "low"})
 	}
 	if key := strings.TrimSpace(os.Getenv("GEMINI_API_KEY")); key != "" {
-		cases = append(cases, liveCase{name: "gemini", cfg: factory.ProfileConfig{Provider: "gemini", APIKey: key}, model: "gemini-2.5-flash", effort: "low"})
+		cases = append(cases, liveCase{name: "gemini", cfg: factory.ProfileConfig{Provider: "gemini", APIKey: key}, model: schema.DefaultModelForProvider("gemini"), effort: "low"})
 	}
 	if key := strings.TrimSpace(os.Getenv("LLAMA_API_KEY")); key != "" {
-		cases = append(cases, liveCase{name: "meta", cfg: factory.ProfileConfig{Provider: "meta", APIKey: key}, model: "Llama-4-Maverick-17B-128E-Instruct-FP8"})
+		cases = append(cases, liveCase{name: "meta", cfg: factory.ProfileConfig{Provider: "meta", APIKey: key}, model: schema.DefaultModelForProvider("meta")})
 	}
 	if key := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY")); key != "" {
-		cases = append(cases, liveCase{name: "openrouter", cfg: factory.ProfileConfig{Provider: "openrouter", APIKey: key}, model: "openai/gpt-5.4"})
+		cases = append(cases, liveCase{name: "openrouter", cfg: factory.ProfileConfig{Provider: "openrouter", APIKey: key}, model: schema.DefaultModelForProvider("openrouter")})
 	}
 
 	if len(cases) == 0 {
@@ -199,7 +199,7 @@ func TestLiveCacheAndContinuity(t *testing.T) {
 		eng1 := newEng()
 		th, err := eng1.CreateThread(ctx, schema.Thread{
 			Provider:        "codex_oauth",
-			Model:           "gpt-6.1-sol",
+			Model:           schema.DefaultModelForProvider("codex_oauth"),
 			ReasoningEffort: "low",
 			SystemPrompt:    sysPrompt,
 		})
@@ -501,7 +501,7 @@ func TestLiveNativeToolsAndViewImage(t *testing.T) {
 		runViewImageCheck(t, "openai", factory.ProfileConfig{
 			Provider: "openai",
 			APIKey:   key,
-		}, "gpt-5.4", "low")
+		}, schema.DefaultModelForProvider("openai"), "low")
 	})
 
 	t.Run("codex_oauth_view_image", func(t *testing.T) {
@@ -515,6 +515,6 @@ func TestLiveNativeToolsAndViewImage(t *testing.T) {
 		runViewImageCheck(t, "codex_oauth", factory.ProfileConfig{
 			Provider:   "codex_oauth",
 			CodexOAuth: auth.NewCodexOAuthManager(auth.CodexOAuthConfig{AuthPath: authPath}),
-		}, "gpt-6.1-sol", "low")
+		}, schema.DefaultModelForProvider("codex_oauth"), "low")
 	})
 }

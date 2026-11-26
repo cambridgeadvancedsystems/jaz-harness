@@ -58,6 +58,9 @@ func (e *Engine) publishEvent(ctx context.Context, threadID string, epoch int64,
 }
 
 func (e *Engine) CreateThread(ctx context.Context, th schema.Thread) (schema.Thread, error) {
+	if strings.TrimSpace(th.Model) == "" && strings.TrimSpace(th.Provider) != "" {
+		th.Model = schema.DefaultModelForProvider(th.Provider)
+	}
 	return e.store.CreateThread(ctx, th)
 }
 

@@ -49,48 +49,194 @@ func (m ModelSpec) EstimateCostUSD(u Usage) float64 {
 	return (inCost + cacheCost + cacheWriteCost + outCost) / 1_000_000.0
 }
 
+type ProviderModelDefaults struct {
+	Provider          string `json:"provider"`
+	DefaultModel      string `json:"default_model"`
+	DefaultImageModel string `json:"default_image_model,omitempty"`
+	UpstreamBasis     string `json:"upstream_basis"`
+}
+
+var builtinProviderDefaults = []ProviderModelDefaults{
+	{
+		Provider:          "openai",
+		DefaultModel:      "gpt-6.2-sol",
+		DefaultImageModel: "gpt-image-2.6-sunburst",
+		UpstreamBasis:     "Codex models.json priority 1 (gpt-6.2-sol) + OpenAI Images API 2.6 flagship (gpt-image-2.6-sunburst)",
+	},
+	{
+		Provider:          "azure_openai",
+		DefaultModel:      "gpt-6.2-sol",
+		DefaultImageModel: "gpt-image-2.6-sunburst",
+		UpstreamBasis:     "OpenAI API parity (gpt-6.2-sol + gpt-image-2.6-sunburst)",
+	},
+	{
+		Provider:          "codex_oauth",
+		DefaultModel:      "gpt-6.2-sol",
+		DefaultImageModel: "gpt-image-2",
+		UpstreamBasis:     "Codex models.json priority 1 (gpt-6.2-sol) + codex-rs/ext/image-generation IMAGE_MODEL (gpt-image-2)",
+	},
+	{
+		Provider:      "anthropic",
+		DefaultModel:  "claude-opus-5-5",
+		UpstreamBasis: "Claude Code cc catalog default + Anthropic API flagship (claude-opus-5-5)",
+	},
+	{
+		Provider:      "vertex_anthropic",
+		DefaultModel:  "claude-opus-5-5",
+		UpstreamBasis: "Claude Code provider_alias_targets.opus.per_provider.vertex (claude-opus-5-5)",
+	},
+	{
+		Provider:      "bedrock_anthropic",
+		DefaultModel:  "claude-opus-5-5",
+		UpstreamBasis: "Claude Code provider_alias_targets.opus.per_provider.bedrock (claude-opus-5-5)",
+	},
+	{
+		Provider:          "grok",
+		DefaultModel:      "grok-4.7",
+		DefaultImageModel: "grok-imagine-image-2.0",
+		UpstreamBasis:     "Grok CLI default_model (grok-4.7) + xAI Images API active model (grok-imagine-image-2.0)",
+	},
+	{
+		Provider:          "gemini",
+		DefaultModel:      "gemini-4-neon",
+		DefaultImageModel: "gemini-nano-banana-2.1",
+		UpstreamBasis:     "Antigravity/Gemini 4 balanced coding flagship (gemini-4-neon) + Google AI GA image model (gemini-nano-banana-2.1)",
+	},
+	{
+		Provider:          "vertex",
+		DefaultModel:      "gemini-4-neon",
+		DefaultImageModel: "gemini-nano-banana-2.1",
+		UpstreamBasis:     "Antigravity/Vertex Gemini 4 balanced coding flagship (gemini-4-neon) + Vertex AI GA image model (gemini-nano-banana-2.1)",
+	},
+	{
+		Provider:          "vertex_interactions",
+		DefaultModel:      "gemini-4-neon",
+		DefaultImageModel: "gemini-nano-banana-2.1",
+		UpstreamBasis:     "Vertex v1beta1 Interactions API Gemini 4 flagship (gemini-4-neon) + Vertex AI GA image model (gemini-nano-banana-2.1)",
+	},
+	{
+		Provider:      "meta",
+		DefaultModel:  "Llama-4-Maverick-17B-128E-Instruct-FP8",
+		UpstreamBasis: "Meta Llama API latest official flagship (Llama-4-Maverick-17B-128E-Instruct-FP8)",
+	},
+	{
+		Provider:      "openrouter",
+		DefaultModel:  "openai/gpt-6.2-sol",
+		UpstreamBasis: "OpenRouter latest OpenAI flagship route (openai/gpt-6.2-sol)",
+	},
+	{
+		Provider:      "bedrock_openai",
+		DefaultModel:  "openai.gpt-oss-120b",
+		UpstreamBasis: "AWS Bedrock OpenAI-compatible open-weight default (openai.gpt-oss-120b)",
+	},
+}
+
+// ProviderDefaults returns a copy of the canonical default model table across
+// all supported providers.
+func ProviderDefaults() []ProviderModelDefaults {
+	out := make([]ProviderModelDefaults, len(builtinProviderDefaults))
+	copy(out, builtinProviderDefaults)
+	return out
+}
+
+func normalizeProviderKey(providerName string) string {
+	switch strings.ToLower(strings.TrimSpace(providerName)) {
+	case "codex":
+		return "codex_oauth"
+	case "xai":
+		return "grok"
+	case "vertex_gemini":
+		return "vertex"
+	case "llama":
+		return "meta"
+	case "bedrock":
+		return "bedrock_openai"
+	default:
+		return strings.ToLower(strings.TrimSpace(providerName))
+	}
+}
+
+// DefaultModelForProvider returns the latest official or upstream-harness-matched
+// default chat/reasoning model ID for providerName, or empty string if unknown.
+func DefaultModelForProvider(providerName string) string {
+	key := normalizeProviderKey(providerName)
+	for _, d := range builtinProviderDefaults {
+		if d.Provider == key {
+			return d.DefaultModel
+		}
+	}
+	return ""
+}
+
+// DefaultImageModelForProvider returns the latest official or upstream-harness-matched
+// native image generation model ID for providerName, or empty string if the
+// provider relies on a fallback image generator.
+func DefaultImageModelForProvider(providerName string) string {
+	key := normalizeProviderKey(providerName)
+	for _, d := range builtinProviderDefaults {
+		if d.Provider == key {
+			return d.DefaultImageModel
+		}
+	}
+	return ""
+}
+
 var builtinModelSpecs = []ModelSpec{
-	// OpenAI & Codex OAuth (aligned with Codex upstream effective windows)
+	// OpenAI & Codex OAuth (aligned with Codex models.json effective windows and OpenAI API specs)
 	{
 		ID:                       "gpt-6.2-sol",
 		Provider:                 "openai",
 		ContextWindow:            500_000,
-		MaxOutputTokens:          32_768,
+		MaxOutputTokens:          128_000,
 		AutoCompactFraction:      0.90,
 		AutoCompactTokenLimit:    450_000,
 		SupportsReasoning:        true,
 		SupportsPromptCache:      true,
 		SupportsRemoteCompaction: true,
-		InputCostPerMillion:      2.50,
-		CachedCostPerMillion:     0.25,
+		InputCostPerMillion:      2.00,
+		CachedCostPerMillion:     0.10,
 		OutputCostPerMillion:     10.00,
 	},
 	{
 		ID:                       "gpt-6.2-astra",
 		Provider:                 "openai",
 		ContextWindow:            272_000,
-		MaxOutputTokens:          32_768,
+		MaxOutputTokens:          128_000,
 		AutoCompactFraction:      0.90,
 		AutoCompactTokenLimit:    244_800,
 		SupportsReasoning:        true,
 		SupportsPromptCache:      true,
 		SupportsRemoteCompaction: true,
-		InputCostPerMillion:      2.50,
-		CachedCostPerMillion:     0.25,
+		InputCostPerMillion:      8.00,
+		CachedCostPerMillion:     0.40,
+		OutputCostPerMillion:     40.00,
+	},
+	{
+		ID:                       "gpt-6.1-terra",
+		Provider:                 "openai",
+		ContextWindow:            500_000,
+		MaxOutputTokens:          128_000,
+		AutoCompactFraction:      0.90,
+		AutoCompactTokenLimit:    450_000,
+		SupportsReasoning:        true,
+		SupportsPromptCache:      true,
+		SupportsRemoteCompaction: true,
+		InputCostPerMillion:      2.00,
+		CachedCostPerMillion:     0.20,
 		OutputCostPerMillion:     10.00,
 	},
 	{
 		ID:                       "gpt-6.1-sol",
 		Provider:                 "openai",
 		ContextWindow:            500_000,
-		MaxOutputTokens:          32_768,
+		MaxOutputTokens:          128_000,
 		AutoCompactFraction:      0.90,
 		AutoCompactTokenLimit:    450_000,
 		SupportsReasoning:        true,
 		SupportsPromptCache:      true,
 		SupportsRemoteCompaction: true,
-		InputCostPerMillion:      2.50,
-		CachedCostPerMillion:     0.25,
+		InputCostPerMillion:      2.00,
+		CachedCostPerMillion:     0.20,
 		OutputCostPerMillion:     10.00,
 	},
 	{
@@ -136,12 +282,57 @@ var builtinModelSpecs = []ModelSpec{
 		OutputCostPerMillion:     8.00,
 	},
 	// Anthropic (direct, Vertex Anthropic, Bedrock Anthropic)
-	// 1M models intentionally compact around 380k (matching Jaz's 400k window override minus reserve).
+	// 1M models intentionally compact around 380k (matching Claude Code 400k window override minus reserve).
 	{
 		ID:                       "claude-opus-5-5",
 		Provider:                 "anthropic",
 		ContextWindow:            1_000_000,
-		MaxOutputTokens:          32_000,
+		MaxOutputTokens:          128_000,
+		AutoCompactFraction:      0.82,
+		AutoCompactTokenLimit:    380_000,
+		SupportsReasoning:        true,
+		SupportsPromptCache:      true,
+		SupportsRemoteCompaction: true,
+		SupportsNativeToolSearch: true,
+		InputCostPerMillion:      4.00,
+		CachedCostPerMillion:     0.20,
+		OutputCostPerMillion:     20.00,
+	},
+	{
+		ID:                       "claude-sonnet-5-5",
+		Provider:                 "anthropic",
+		ContextWindow:            1_000_000,
+		MaxOutputTokens:          128_000,
+		AutoCompactFraction:      0.82,
+		AutoCompactTokenLimit:    380_000,
+		SupportsReasoning:        true,
+		SupportsPromptCache:      true,
+		SupportsRemoteCompaction: true,
+		SupportsNativeToolSearch: true,
+		InputCostPerMillion:      2.00,
+		CachedCostPerMillion:     0.10,
+		OutputCostPerMillion:     10.00,
+	},
+	{
+		ID:                       "claude-haiku-5-5",
+		Provider:                 "anthropic",
+		ContextWindow:            1_000_000,
+		MaxOutputTokens:          128_000,
+		AutoCompactFraction:      0.82,
+		AutoCompactTokenLimit:    380_000,
+		SupportsReasoning:        true,
+		SupportsPromptCache:      true,
+		SupportsRemoteCompaction: true,
+		SupportsNativeToolSearch: true,
+		InputCostPerMillion:      0.10,
+		CachedCostPerMillion:     0.01,
+		OutputCostPerMillion:     0.50,
+	},
+	{
+		ID:                       "claude-fable-5",
+		Provider:                 "anthropic",
+		ContextWindow:            1_000_000,
+		MaxOutputTokens:          128_000,
 		AutoCompactFraction:      0.82,
 		AutoCompactTokenLimit:    380_000,
 		SupportsReasoning:        true,
@@ -153,19 +344,94 @@ var builtinModelSpecs = []ModelSpec{
 		OutputCostPerMillion:     75.00,
 	},
 	{
-		ID:                       "claude-fable-5",
+		ID:                       "claude-opus-5",
 		Provider:                 "anthropic",
 		ContextWindow:            1_000_000,
-		MaxOutputTokens:          32_000,
+		MaxOutputTokens:          128_000,
 		AutoCompactFraction:      0.82,
 		AutoCompactTokenLimit:    380_000,
 		SupportsReasoning:        true,
 		SupportsPromptCache:      true,
 		SupportsRemoteCompaction: true,
 		SupportsNativeToolSearch: true,
-		InputCostPerMillion:      15.00,
-		CachedCostPerMillion:     1.50,
-		OutputCostPerMillion:     75.00,
+		InputCostPerMillion:      4.00,
+		CachedCostPerMillion:     0.20,
+		OutputCostPerMillion:     20.00,
+	},
+	{
+		ID:                       "claude-sonnet-5",
+		Provider:                 "anthropic",
+		ContextWindow:            1_000_000,
+		MaxOutputTokens:          128_000,
+		AutoCompactFraction:      0.82,
+		AutoCompactTokenLimit:    380_000,
+		SupportsReasoning:        true,
+		SupportsPromptCache:      true,
+		SupportsRemoteCompaction: true,
+		SupportsNativeToolSearch: true,
+		InputCostPerMillion:      2.00,
+		CachedCostPerMillion:     0.10,
+		OutputCostPerMillion:     10.00,
+	},
+	{
+		ID:                       "claude-opus-4-8",
+		Provider:                 "anthropic",
+		ContextWindow:            1_000_000,
+		MaxOutputTokens:          128_000,
+		AutoCompactFraction:      0.82,
+		AutoCompactTokenLimit:    380_000,
+		SupportsReasoning:        true,
+		SupportsPromptCache:      true,
+		SupportsRemoteCompaction: true,
+		SupportsNativeToolSearch: true,
+		InputCostPerMillion:      5.00,
+		CachedCostPerMillion:     0.50,
+		OutputCostPerMillion:     25.00,
+	},
+	{
+		ID:                       "claude-opus-4-7",
+		Provider:                 "anthropic",
+		ContextWindow:            1_000_000,
+		MaxOutputTokens:          128_000,
+		AutoCompactFraction:      0.82,
+		AutoCompactTokenLimit:    380_000,
+		SupportsReasoning:        true,
+		SupportsPromptCache:      true,
+		SupportsRemoteCompaction: true,
+		SupportsNativeToolSearch: true,
+		InputCostPerMillion:      5.00,
+		CachedCostPerMillion:     0.50,
+		OutputCostPerMillion:     25.00,
+	},
+	{
+		ID:                       "claude-opus-4-6",
+		Provider:                 "anthropic",
+		ContextWindow:            1_000_000,
+		MaxOutputTokens:          128_000,
+		AutoCompactFraction:      0.82,
+		AutoCompactTokenLimit:    380_000,
+		SupportsReasoning:        true,
+		SupportsPromptCache:      true,
+		SupportsRemoteCompaction: true,
+		SupportsNativeToolSearch: true,
+		InputCostPerMillion:      5.00,
+		CachedCostPerMillion:     0.50,
+		OutputCostPerMillion:     25.00,
+	},
+	{
+		ID:                       "claude-sonnet-4-6",
+		Provider:                 "anthropic",
+		ContextWindow:            1_000_000,
+		MaxOutputTokens:          128_000,
+		AutoCompactFraction:      0.82,
+		AutoCompactTokenLimit:    380_000,
+		SupportsReasoning:        true,
+		SupportsPromptCache:      true,
+		SupportsRemoteCompaction: true,
+		SupportsNativeToolSearch: true,
+		InputCostPerMillion:      3.00,
+		CachedCostPerMillion:     0.30,
+		OutputCostPerMillion:     15.00,
 	},
 	{
 		ID:                       "claude-opus-4-5",
@@ -216,7 +482,7 @@ var builtinModelSpecs = []ModelSpec{
 		ID:                       "claude-haiku-4-5",
 		Provider:                 "anthropic",
 		ContextWindow:            200_000,
-		MaxOutputTokens:          16_384,
+		MaxOutputTokens:          64_000,
 		AutoCompactFraction:      0.85,
 		AutoCompactTokenLimit:    165_000,
 		SupportsReasoning:        true,
@@ -229,6 +495,19 @@ var builtinModelSpecs = []ModelSpec{
 	// Google Gemini (Vertex AI & Gemini API)
 	// 1M models compact at 400k by default to preserve reasoning sharpness and cost efficiency.
 	{
+		ID:                    "gemini-4-carbon",
+		Provider:              "gemini",
+		ContextWindow:         1_048_576,
+		MaxOutputTokens:       65_536,
+		AutoCompactFraction:   0.80,
+		AutoCompactTokenLimit: 400_000,
+		SupportsReasoning:     true,
+		SupportsPromptCache:   true,
+		InputCostPerMillion:   3.00,
+		CachedCostPerMillion:  0.30,
+		OutputCostPerMillion:  15.00,
+	},
+	{
 		ID:                    "gemini-4-neon",
 		Provider:              "gemini",
 		ContextWindow:         1_048_576,
@@ -237,8 +516,8 @@ var builtinModelSpecs = []ModelSpec{
 		AutoCompactTokenLimit: 400_000,
 		SupportsReasoning:     true,
 		SupportsPromptCache:   true,
-		InputCostPerMillion:   2.50,
-		CachedCostPerMillion:  0.25,
+		InputCostPerMillion:   3.00,
+		CachedCostPerMillion:  0.30,
 		OutputCostPerMillion:  15.00,
 	},
 	{
@@ -250,9 +529,48 @@ var builtinModelSpecs = []ModelSpec{
 		AutoCompactTokenLimit: 400_000,
 		SupportsReasoning:     true,
 		SupportsPromptCache:   true,
-		InputCostPerMillion:   0.50,
-		CachedCostPerMillion:  0.05,
-		OutputCostPerMillion:  3.00,
+		InputCostPerMillion:   1.50,
+		CachedCostPerMillion:  0.15,
+		OutputCostPerMillion:  7.50,
+	},
+	{
+		ID:                    "gemini-4-argon",
+		Provider:              "gemini",
+		ContextWindow:         1_048_576,
+		MaxOutputTokens:       65_536,
+		AutoCompactFraction:   0.80,
+		AutoCompactTokenLimit: 400_000,
+		SupportsReasoning:     true,
+		SupportsPromptCache:   true,
+		InputCostPerMillion:   3.00,
+		CachedCostPerMillion:  0.30,
+		OutputCostPerMillion:  15.00,
+	},
+	{
+		ID:                    "gemini-3.5-flash-lite",
+		Provider:              "gemini",
+		ContextWindow:         1_048_576,
+		MaxOutputTokens:       65_536,
+		AutoCompactFraction:   0.80,
+		AutoCompactTokenLimit: 400_000,
+		SupportsReasoning:     true,
+		SupportsPromptCache:   true,
+		InputCostPerMillion:   0.30,
+		CachedCostPerMillion:  0.03,
+		OutputCostPerMillion:  2.50,
+	},
+	{
+		ID:                    "gemini-3.1-pro",
+		Provider:              "gemini",
+		ContextWindow:         1_048_576,
+		MaxOutputTokens:       65_536,
+		AutoCompactFraction:   0.80,
+		AutoCompactTokenLimit: 400_000,
+		SupportsReasoning:     true,
+		SupportsPromptCache:   true,
+		InputCostPerMillion:   2.00,
+		CachedCostPerMillion:  0.20,
+		OutputCostPerMillion:  12.00,
 	},
 	{
 		ID:                    "gemini-2.5-pro",
@@ -280,7 +598,85 @@ var builtinModelSpecs = []ModelSpec{
 		CachedCostPerMillion:  0.075,
 		OutputCostPerMillion:  2.50,
 	},
-	// xAI / Grok (Grok CLI defaults to 85% of context window; 2M fast models capped at 400k by default)
+	// xAI / Grok (Grok CLI defaults to 85% of context window; 1M/2M models capped at 400k by default)
+	{
+		ID:                    "grok-4.7",
+		Provider:              "grok",
+		ContextWindow:         500_000,
+		MaxOutputTokens:       32_768,
+		AutoCompactFraction:   0.85,
+		AutoCompactTokenLimit: 425_000,
+		SupportsReasoning:     true,
+		SupportsPromptCache:   true,
+		InputCostPerMillion:   2.00,
+		CachedCostPerMillion:  0.50,
+		OutputCostPerMillion:  6.00,
+	},
+	{
+		ID:                    "grok-4.6",
+		Provider:              "grok",
+		ContextWindow:         500_000,
+		MaxOutputTokens:       32_768,
+		AutoCompactFraction:   0.85,
+		AutoCompactTokenLimit: 425_000,
+		SupportsReasoning:     true,
+		SupportsPromptCache:   true,
+		InputCostPerMillion:   2.00,
+		CachedCostPerMillion:  0.50,
+		OutputCostPerMillion:  6.00,
+	},
+	{
+		ID:                    "grok-4.5",
+		Provider:              "grok",
+		ContextWindow:         500_000,
+		MaxOutputTokens:       32_768,
+		AutoCompactFraction:   0.85,
+		AutoCompactTokenLimit: 425_000,
+		SupportsReasoning:     true,
+		SupportsPromptCache:   true,
+		InputCostPerMillion:   2.00,
+		CachedCostPerMillion:  0.50,
+		OutputCostPerMillion:  6.00,
+	},
+	{
+		ID:                    "grok-4.3",
+		Provider:              "grok",
+		ContextWindow:         1_000_000,
+		MaxOutputTokens:       32_768,
+		AutoCompactFraction:   0.85,
+		AutoCompactTokenLimit: 400_000,
+		SupportsReasoning:     true,
+		SupportsPromptCache:   true,
+		InputCostPerMillion:   1.25,
+		CachedCostPerMillion:  0.31,
+		OutputCostPerMillion:  5.00,
+	},
+	{
+		ID:                    "grok-4.20",
+		Provider:              "grok",
+		ContextWindow:         1_000_000,
+		MaxOutputTokens:       32_768,
+		AutoCompactFraction:   0.85,
+		AutoCompactTokenLimit: 400_000,
+		SupportsReasoning:     true,
+		SupportsPromptCache:   true,
+		InputCostPerMillion:   2.00,
+		CachedCostPerMillion:  0.50,
+		OutputCostPerMillion:  6.00,
+	},
+	{
+		ID:                    "grok-build-0.1",
+		Provider:              "grok",
+		ContextWindow:         256_000,
+		MaxOutputTokens:       32_768,
+		AutoCompactFraction:   0.85,
+		AutoCompactTokenLimit: 217_600,
+		SupportsReasoning:     true,
+		SupportsPromptCache:   true,
+		InputCostPerMillion:   1.00,
+		CachedCostPerMillion:  0.20,
+		OutputCostPerMillion:  2.00,
+	},
 	{
 		ID:                    "grok-4",
 		Provider:              "grok",

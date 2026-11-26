@@ -17,21 +17,32 @@ Any intentional divergence from upstream defaults (such as lower quality-preserv
 
 Whenever adding, renaming, modifying, or removing any provider, native hosted tool (such as `x_search`, `web_search`, `web_fetch`, `googleSearch`, `urlContext`, `image_generation`), or universal multimodal/image tool (`view_image`, `generate_image`, multimodal tool-response encoding), **update the `Native Provider Tool Matrix` section in `README.md` in the same change** so the documented capability table stays 100% accurate with the implementation.
 
+## Latest Model & Upstream Harness Default Maintenance Rule
+
+Across **all** providers and harness surfaces (chat, reasoning, compaction, CLI defaults, and image generation), `jaz-harness` must track the **latest official vendor models** or **match upstream coding harnesses** (Codex, Claude Code, Grok CLI, and Antigravity / Vertex Gemini). Never leave superseded or deprecated models (such as `gpt-image-1.5`, `gemini-2.5-flash-image`, `grok-imagine-image`, or older flagship chat slugs) as package defaults.
+
+Whenever adding a provider, bumping model catalogs, or modifying `DefaultModel` / `DefaultImageModel`:
+
+1. Re-check both the upstream coding harnesses (`codex-rs/models-manager/models.json` and `codex-rs/ext/image-generation`, Claude Code model catalog, Grok CLI default model settings, Antigravity / Vertex Gemini defaults) and official vendor API documentation.
+2. Keep every provider package's exported default constants (`openai.DefaultModel`, `openai.DefaultImageModel`, `openai.DefaultCodexImageModel`, `anthropic.DefaultModel`, `grok.DefaultModel`, `grok.DefaultImageModel`, `gemini.DefaultModel`, `gemini.DefaultImageModel`, `openaicompat.DefaultMetaModel`, `openaicompat.DefaultOpenRouterModel`, `openaicompat.DefaultBedrockOpenAIModel`) synchronized with `schema.ProviderDefaults()`, `schema.DefaultModelForProvider()`, `schema.DefaultImageModelForProvider()`, and `schema/models.go` model specs (enforced by unit tests in `provider/factory`).
+3. Update both the `Model Defaults & Upstream Parity` table and `Native Provider Tool Matrix` in `README.md` plus the compaction table below in the same change.
+
 ## Maintained Per-Model Compaction-Threshold Recipe
 
-1M/2M raw context windows suffer noticeable quality degradation ("context rot") and cost spikes long before hitting 85–90% of nominal capacity. `schema/models.go` therefore sets explicit quality-tuned `AutoCompactTokenLimit` defaults aligned with Jaz's overrides and upstream coding agents:
+1M/2M raw context windows suffer noticeable quality degradation ("context rot") and cost spikes long before hitting 85–90% of nominal capacity. `schema/models.go` therefore sets explicit quality-tuned `AutoCompactTokenLimit` defaults aligned with upstream coding agents and quality ceilings:
 
 | Model Family | Raw Context Window | Upstream Reference | `jaz-harness` Default Trigger | Notes |
 | --- | --- | --- | --- | --- |
-| `gpt-6.2-sol`, `gpt-6.1-sol` | 500k (872k max) | Codex `models.json`: `context_window=500k`, 90% auto-compact | **450,000** | Uses native `/responses/compact` + readable cross-provider fallback digest |
-| `gpt-6.2-astra` | 272k (872k max) | Codex `models.json`: `context_window=272k`, 90% = 244,800 | **244,800** | Matches Codex effective working window |
+| `gpt-6.2-sol`, `gpt-6.1-sol`, `gpt-6.1-terra` | 500k (1.05M API max) | Codex `models.json`: `context_window=500k`, 90% auto-compact | **450,000** | Uses native `/responses/compact` + readable cross-provider fallback digest |
+| `gpt-6.2-astra` | 272k (1.05M API max) | Codex `models.json`: `context_window=272k`, 90% = 244,800 | **244,800** | Matches Codex effective working window |
 | `gpt-5.4`, `gpt-5` | 400k | Codex ~245k–250k working-window cap | **245,000** | Keeps multi-step coding accuracy sharp well below 400k |
 | `o3` | 200k | 85% of 200k | **170,000** | Native `/responses/compact` supported |
-| `claude-opus-5-5`, `claude-fable-5*`, `claude-opus-4-5`, `claude-sonnet-4-5` | 1,000k (1M) | Jaz `CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000` minus reserve (Anthropic API default: 150k) | **380,000** | Intentionally well below 1M; supports Anthropic `compact-2026-01-12` (`compact_20260112`) |
-| `claude-opus-4-1`, `claude-haiku-4-5` | 200k | Claude Code 200k window minus buffer (Jaz Cloud 180k ceiling) | **165,000** | Safe headroom for thinking + output |
-| `gemini-4-neon`, `gemini-4-hydrogen`, `gemini-2.5-pro`, `gemini-2.5-flash` | 1,048,576 (1M) | Jaz 1M quality cap | **400,000** | Keeps implicit/durable prefix caching fast and recall high |
-| `grok-4`, `grok-code` | 256k | Grok CLI `auto_compact_threshold_percent = 85` | **217,600** | Matches upstream Grok CLI 85% default |
-| `grok-4-fast` | 2,000k (2M) | Jaz long-window quality cap | **400,000** | Prevents 1.6M+ bloat while remaining caller-overridable |
+| `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5*`, `claude-opus-5`, `claude-sonnet-5`, `claude-opus-4-8/4-7/4-6/4-5`, `claude-sonnet-4-6/4-5` | 1,000k (1M) | `CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000` minus reserve (Anthropic API default: 150k) | **380,000** | Intentionally well below 1M; supports Anthropic `compact-2026-01-12` (`compact_20260112`) |
+| `claude-opus-4-1`, `claude-haiku-4-5` | 200k | Claude Code 200k window minus buffer | **165,000** | Safe headroom for thinking + output |
+| `gemini-4-carbon`, `gemini-4-neon`, `gemini-4-hydrogen`, `gemini-4-argon`, `gemini-3.5-flash-lite`, `gemini-3.1-pro`, `gemini-2.5-pro`, `gemini-2.5-flash` | 1,048,576 (1M) | 1M quality cap | **400,000** | Keeps implicit/durable prefix caching fast and recall high |
+| `grok-4.7`, `grok-4.6`, `grok-4.5` | 500k | Grok CLI `auto_compact_threshold_percent = 85` on 500k | **425,000** | Matches upstream Grok CLI 85% default on 500k window |
+| `grok-4`, `grok-build-0.1`, `grok-code` | 256k | Grok CLI `auto_compact_threshold_percent = 85` on 256k | **217,600** | Matches upstream Grok CLI 85% default |
+| `grok-4-fast`, `grok-4.3`, `grok-4.20*` | 1,000k–2,000k (1M–2M) | Long-window quality cap | **400,000** | Prevents 1M+ bloat while remaining caller-overridable |
 | `Llama-4-Maverick`, `Llama-4-Scout` | 1,000k (1M) | Long-context recall cap | **300,000** | `Llama-3.3-70B` (128k) defaults to **100,000** |
 
 ### Override Precedence (`compact.Config`)

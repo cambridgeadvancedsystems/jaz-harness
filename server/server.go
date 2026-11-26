@@ -85,6 +85,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleListModels(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"providers": s.engine.Providers().Names(),
+		"defaults":  schema.ProviderDefaults(),
 		"models":    schema.BuiltinModels(),
 	})
 }

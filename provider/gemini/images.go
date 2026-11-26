@@ -12,7 +12,7 @@ import (
 	"github.com/cambridgeadvancedsystems/jaz-harness/schema"
 )
 
-const DefaultImageModel = "gemini-2.5-flash-image"
+const DefaultImageModel = "gemini-nano-banana-2.1"
 
 // GenerateImage implements provider.ImageGenerator using Gemini's native
 // multimodal `:generateContent` surface (`responseModalities: ["TEXT", "IMAGE"]`),

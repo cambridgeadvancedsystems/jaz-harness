@@ -16,6 +16,7 @@ import (
 
 const (
 	DefaultBaseURL = "https://api.x.ai/v1"
+	DefaultModel   = "grok-4.7"
 	WireFormat     = "xai_responses"
 )
 

@@ -197,6 +197,9 @@ func (e *Engine) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, erro
 	if strings.TrimSpace(req.Model) != "" {
 		th.Model = strings.TrimSpace(req.Model)
 	}
+	if strings.TrimSpace(th.Model) == "" && strings.TrimSpace(th.Provider) != "" {
+		th.Model = schema.DefaultModelForProvider(th.Provider)
+	}
 	if strings.TrimSpace(req.ReasoningEffort) != "" {
 		th.ReasoningEffort = strings.TrimSpace(req.ReasoningEffort)
 	}

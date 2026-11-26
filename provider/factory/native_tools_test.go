@@ -18,7 +18,12 @@ import (
 
 	"github.com/cambridgeadvancedsystems/jaz-harness/auth"
 	"github.com/cambridgeadvancedsystems/jaz-harness/provider"
+	"github.com/cambridgeadvancedsystems/jaz-harness/provider/anthropic"
 	"github.com/cambridgeadvancedsystems/jaz-harness/provider/factory"
+	"github.com/cambridgeadvancedsystems/jaz-harness/provider/gemini"
+	"github.com/cambridgeadvancedsystems/jaz-harness/provider/grok"
+	"github.com/cambridgeadvancedsystems/jaz-harness/provider/openai"
+	"github.com/cambridgeadvancedsystems/jaz-harness/provider/openaicompat"
 	"github.com/cambridgeadvancedsystems/jaz-harness/schema"
 )
 
@@ -149,14 +154,14 @@ func TestGrokNativeXSearchCitationsMultimodalToolOutputAndImageGen(t *testing.T)
 	imgResp, err := gen.GenerateImage(context.Background(), provider.ImageGenerationRequest{
 		Prompt: "A blue square",
 	})
-	if err != nil || len(imgResp.Images) != 1 || imgResp.Images[0].Base64 != blueB64 || !strings.Contains(imgGenReqBody, `"response_format":"b64_json"`) {
+	if err != nil || len(imgResp.Images) != 1 || imgResp.Images[0].Base64 != blueB64 || !strings.Contains(imgGenReqBody, `"response_format":"b64_json"`) || !strings.Contains(imgGenReqBody, `"model":"`+grok.DefaultImageModel+`"`) {
 		t.Fatalf("grok GenerateImage failed: err=%v resp=%+v req=%s", err, imgResp, imgGenReqBody)
 	}
 	editResp, err := gen.GenerateImage(context.Background(), provider.ImageGenerationRequest{
 		Prompt:          "Turn red into blue",
 		ReferenceImages: []schema.ImageSource{{MediaType: "image/png", Base64: redB64}},
 	})
-	if err != nil || len(editResp.Images) != 1 || !strings.Contains(imgEditReqBody, `"image":{"url":"data:image/png;base64,`) {
+	if err != nil || len(editResp.Images) != 1 || !strings.Contains(imgEditReqBody, `"image":{"url":"data:image/png;base64,`) || !strings.Contains(imgEditReqBody, `"model":"`+grok.DefaultImageModel+`"`) {
 		t.Fatalf("grok edit failed: err=%v resp=%+v req=%s", err, editResp, imgEditReqBody)
 	}
 }
@@ -342,7 +347,7 @@ func TestOpenAIAndCodexImageGenerationCallContinuityAndImagesAPI(t *testing.T) {
 	if err != nil || codexRes.ID != "gen_9" || codexRes.Metadata["imagegen_request_id"] != "ig_req_9" {
 		t.Fatalf("codex image edit failed: err=%v res=%+v", err, codexRes)
 	}
-	if !strings.Contains(codexEditBody, `"images":[{"image_url":"data:image/png;base64,`) || !strings.Contains(codexEditBody, `"background":"transparent"`) {
+	if !strings.Contains(codexEditBody, `"model":"`+openai.DefaultCodexImageModel+`"`) || !strings.Contains(codexEditBody, `"images":[{"image_url":"data:image/png;base64,`) || !strings.Contains(codexEditBody, `"background":"transparent"`) {
 		t.Fatalf("unexpected codex edit payload: %s", codexEditBody)
 	}
 }
@@ -443,9 +448,12 @@ func TestGeminiMultimodalToolResponseInteractionsAndImageGen(t *testing.T) {
 		switch {
 		case strings.Contains(r.URL.Path, ":generateContent"):
 			imgGenBody = string(body)
+			if !strings.Contains(r.URL.Path, "/models/"+gemini.DefaultImageModel+":generateContent") {
+				t.Errorf("unexpected gemini default image path: %s", r.URL.Path)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"modelVersion": "gemini-2.5-flash-image",
+				"modelVersion": gemini.DefaultImageModel,
 				"candidates": []map[string]any{{
 					"content": map[string]any{
 						"role": "model",
@@ -620,5 +628,122 @@ func TestOpenAICompatMultimodalUserAndToolResultImages(t *testing.T) {
 	}
 	if strings.Count(reqBody, `"type":"image_url"`) != 2 || !strings.Contains(reqBody, `"[Image output from view_image]"`) {
 		t.Fatalf("expected user + companion tool image_url blocks in openaicompat payload: %s", reqBody)
+	}
+}
+
+func TestProviderDefaultModelConstantsAndImageParameterHandling(t *testing.T) {
+	// Verify every provider package's exported default constants stay 100%
+	// synchronized with schema.DefaultModelForProvider and schema.DefaultImageModelForProvider.
+	chatChecks := map[string]string{
+		"openai":              openai.DefaultModel,
+		"azure_openai":        openai.DefaultModel,
+		"codex_oauth":         openai.DefaultModel,
+		"codex":               openai.DefaultModel,
+		"anthropic":           anthropic.DefaultModel,
+		"vertex_anthropic":    anthropic.DefaultModel,
+		"bedrock_anthropic":   anthropic.DefaultModel,
+		"grok":                grok.DefaultModel,
+		"xai":                 grok.DefaultModel,
+		"gemini":              gemini.DefaultModel,
+		"vertex":              gemini.DefaultModel,
+		"vertex_gemini":       gemini.DefaultModel,
+		"vertex_interactions": gemini.DefaultModel,
+		"meta":                openaicompat.DefaultMetaModel,
+		"llama":               openaicompat.DefaultMetaModel,
+		"openrouter":          openaicompat.DefaultOpenRouterModel,
+		"bedrock_openai":      openaicompat.DefaultBedrockOpenAIModel,
+	}
+	for prov, want := range chatChecks {
+		if got := schema.DefaultModelForProvider(prov); got != want || got == "" {
+			t.Fatalf("DefaultModelForProvider(%q) = %q, want %q", prov, got, want)
+		}
+	}
+
+	imgChecks := map[string]string{
+		"openai":              openai.DefaultImageModel,
+		"azure_openai":        openai.DefaultImageModel,
+		"codex_oauth":         openai.DefaultCodexImageModel,
+		"codex":               openai.DefaultCodexImageModel,
+		"grok":                grok.DefaultImageModel,
+		"xai":                 grok.DefaultImageModel,
+		"gemini":              gemini.DefaultImageModel,
+		"vertex":              gemini.DefaultImageModel,
+		"vertex_interactions": gemini.DefaultImageModel,
+		"anthropic":           "",
+		"meta":                "",
+	}
+	for prov, want := range imgChecks {
+		if got := schema.DefaultImageModelForProvider(prov); got != want {
+			t.Fatalf("DefaultImageModelForProvider(%q) = %q, want %q", prov, got, want)
+		}
+	}
+
+	// Verify direct OpenAI image defaults (`gpt-image-2.6-sunburst`), transparent
+	// output_format defaulting (`png`), and gpt-image-2* `input_fidelity` omission
+	// vs legacy gpt-image-1.5 preservation.
+	greenB64 := tinyPNGBase64(t, color.RGBA{G: 255, A: 255})
+	var lastGenBody string
+	var lastEditBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.URL.Path == "/v1/images/generations" {
+			lastGenBody = string(body)
+		} else {
+			lastEditBody = string(body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"b64_json": greenB64}},
+		})
+	}))
+	defer srv.Close()
+
+	p, err := factory.New(factory.ProfileConfig{
+		Provider:   "openai",
+		BaseURL:    srv.URL + "/v1",
+		APIKey:     "sk-test",
+		HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	imgGen := p.(provider.ImageGenerator)
+
+	res, err := imgGen.GenerateImage(context.Background(), provider.ImageGenerationRequest{
+		Prompt:                "Vector badge icon",
+		TransparentBackground: true,
+	})
+	if err != nil || res.Model != openai.DefaultImageModel {
+		t.Fatalf("direct openai GenerateImage default model = %q err=%v, want %q", res.Model, err, openai.DefaultImageModel)
+	}
+	if !strings.Contains(lastGenBody, `"model":"`+openai.DefaultImageModel+`"`) || !strings.Contains(lastGenBody, `"output_format":"png"`) || !strings.Contains(lastGenBody, `"background":"transparent"`) {
+		t.Fatalf("unexpected direct openai generate body: %s", lastGenBody)
+	}
+
+	// Default gpt-image-2.6-sunburst edit must omit deprecated input_fidelity.
+	_, err = imgGen.GenerateImage(context.Background(), provider.ImageGenerationRequest{
+		Prompt:          "Refine edges",
+		InputFidelity:   "high",
+		ReferenceImages: []schema.ImageSource{{URL: "https://example.com/ref.png"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(lastEditBody, `"model":"`+openai.DefaultImageModel+`"`) || strings.Contains(lastEditBody, `"input_fidelity"`) {
+		t.Fatalf("gpt-image-2.6 edit must omit input_fidelity: %s", lastEditBody)
+	}
+
+	// Explicit legacy gpt-image-1.5 edit still forwards input_fidelity.
+	_, err = imgGen.GenerateImage(context.Background(), provider.ImageGenerationRequest{
+		Model:           "gpt-image-1.5",
+		Prompt:          "Refine edges",
+		InputFidelity:   "high",
+		ReferenceImages: []schema.ImageSource{{URL: "https://example.com/ref.png"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(lastEditBody, `"model":"gpt-image-1.5"`) || !strings.Contains(lastEditBody, `"input_fidelity":"high"`) {
+		t.Fatalf("legacy gpt-image-1.5 edit must preserve input_fidelity: %s", lastEditBody)
 	}
 }
